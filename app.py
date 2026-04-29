@@ -146,9 +146,17 @@ def fmt_num(value: object) -> str:
 def status_color(status: str) -> str:
     if status == "VALID TRADE":
         return "#16a34a"
-    if status in {"WAIT", "WAIT FOR PULLBACK"}:
+    if status in {"WAIT", "WAIT FOR PULLBACK", "WAIT FOR REVERSAL"}:
         return "#d6a100"
     return "#dc2626"
+
+
+def status_icon(status: str) -> str:
+    if status == "VALID TRADE":
+        return ":green[VALID TRADE]"
+    if status in {"WAIT", "WAIT FOR PULLBACK", "WAIT FOR REVERSAL"}:
+        return f":orange[{status}]"
+    return f":red[{status}]"
 
 
 def is_valid_ticker(ticker: str) -> bool:
@@ -432,6 +440,7 @@ def extract_candidate(ticker: str, state: AppState, settings: ScannerSettings) -
 
     current_price = float(today["Close"].iloc[-1])
     open_price = float(regular["Open"].iloc[0])
+    last_regular_price = float(regular["Close"].iloc[-1])
     previous_close = open_price
     day_high = float(regular["High"].max())
     day_low = float(regular["Low"].min())
@@ -443,6 +452,7 @@ def extract_candidate(ticker: str, state: AppState, settings: ScannerSettings) -
         return None
 
     gain_pct = ((current_price - previous_close) / previous_close) * 100 if previous_close > 0 else 0.0
+    after_hours_gain_pct = ((current_price - last_regular_price) / last_regular_price) * 100 if last_regular_price > 0 and len(today) > len(regular) else 0.0
     relative_volume = estimate_relative_volume(volume, regular)
     near_high_pct = ((day_high - current_price) / current_price) * 100 if current_price > 0 else 100.0
     volume_acceleration, volume_spike = detect_volume_acceleration(regular, settings.volume_acceleration_threshold)
@@ -497,6 +507,7 @@ def extract_candidate(ticker: str, state: AppState, settings: ScannerSettings) -
         "Day High": round(day_high, 4),
         "Day Low": round(day_low, 4),
         "Intraday Gain %": round(gain_pct, 2),
+        "After Hours Gain %": round(after_hours_gain_pct, 2),
         "Volume": volume,
         "Average Volume": int(float(regular["Volume"].tail(20).mean()) * 78),
         "Relative Volume": round(relative_volume, 2),
@@ -585,10 +596,12 @@ def rr_ratio(entry: float, stop: float, target: float) -> Optional[float]:
 def calculate_trade_plan(row: pd.Series) -> dict[str, object]:
     ticker = str(row["Ticker"]).upper()
     current_price = round_cent(get_value(row, "Current Price"))
+    open_price = round_cent(get_value(row, "Open", current_price))
     day_high = round_cent(get_value(row, "Day High", current_price))
     day_low = round_cent(get_value(row, "Day Low", current_price))
     vwap = round_cent(get_value(row, "VWAP", current_price))
     gain_pct = get_value(row, "Intraday Gain %")
+    after_hours_gain_pct = get_value(row, "After Hours Gain %")
     volume = int(get_value(row, "Volume"))
     relative_volume = get_value(row, "Relative Volume")
     near_high_pct = get_value(row, "Near High %", 100.0)
@@ -614,86 +627,130 @@ def calculate_trade_plan(row: pd.Series) -> dict[str, object]:
 
     near_support = 0 <= distance_from_support_pct <= 3.5
     near_breakout = -1.0 <= distance_to_breakout_pct <= 2.5
-    near_vwap_reclaim = current_price >= vwap and distance_to_vwap_pct <= 2.5
+    strong_volume = relative_volume >= 1.2 or volume_spike or volume_acceleration >= 1.5
+    price_above_open = current_price >= open_price
+    price_above_vwap = current_price >= vwap
+    vwap_reclaim_confirmed = price_above_vwap and distance_to_vwap_pct <= 2.5 and strong_volume
+    after_hours_reclaim = after_hours_gain_pct > 0 and current_price >= min(open_price, vwap) and strong_volume
+    bullish_momentum_gate = gain_pct >= 0 or price_above_open or vwap_reclaim_confirmed or after_hours_reclaim
+    strongly_red = gain_pct < -3
+    below_open_and_vwap = current_price < open_price and current_price < vwap
+    recent_bounce_reclaim = near_support and (higher_lows or volume_spike or volume_acceleration >= 1.5) and bullish_momentum_gate
+    near_vwap_reclaim = vwap_reclaim_confirmed
 
-    if halt_candidate:
-        setup_type = "Halt candidate"
-    elif pre_breakout_setup and near_breakout:
-        setup_type = "Early breakout setup"
-    elif pre_breakout_setup:
-        setup_type = "Pre-momentum"
+    if strongly_red:
+        setup_type = "WEAK / NO LONG"
+    elif below_open_and_vwap:
+        setup_type = "WAIT FOR REVERSAL"
     elif current_price < support_low:
         setup_type = "Fake breakdown reclaim"
-    elif near_support:
+    elif after_hours_reclaim:
+        setup_type = "AFTER-HOURS RECLAIM"
+    elif halt_candidate:
+        setup_type = "Halt candidate"
+    elif pre_breakout_setup or near_breakout:
+        setup_type = "PRE-BREAKOUT"
+    elif recent_bounce_reclaim:
         setup_type = "Pullback-to-support reclaim"
     elif near_vwap_reclaim:
         setup_type = "VWAP reclaim"
-    elif near_breakout:
-        setup_type = "Early breakout setup"
     elif extended_pct > 12:
         setup_type = "Wait for pullback"
     else:
-        setup_type = "Mid-range wait"
+        setup_type = "WAIT FOR REVERSAL"
 
-    status = "VALID TRADE"
+    status = "WAIT"
     reason = ""
     buffer = max(round_cent(current_price * 0.015), 0.02)
     stop_buffer = max(round_cent(current_price * 0.025), 0.03)
 
-    if current_price < support_low:
+    if strongly_red:
+        status = "WAIT FOR REVERSAL"
+        reason = "Needs reclaim above VWAP/day open before any long."
+    elif below_open_and_vwap:
+        status = "WAIT FOR REVERSAL"
+        reason = "Price is below both day open and VWAP; no active long until reclaim confirms."
+    elif not bullish_momentum_gate:
+        status = "WEAK / NO LONG"
+        reason = "Bullish momentum gate failed: price is not green, above open, reclaiming VWAP, or holding positive after-hours action."
+    elif current_price < support_low:
         status = "NO TRADE"
         reason = f"Price is below support low at {support_low:.2f}; long structure is broken."
-    elif extended_pct > 12 and setup_type not in {"Early breakout setup", "Halt candidate"}:
+    elif extended_pct > 12 and setup_type not in {"PRE-BREAKOUT", "Halt candidate", "AFTER-HOURS RECLAIM"}:
         status = "WAIT FOR PULLBACK"
         reason = f"Price is {extended_pct:.1f}% above support, so buying now would chase the move."
     elif support_high < current_price < breakout_level and not near_vwap_reclaim:
         status = "WAIT"
-        reason = "Price is mid-range between support and breakout; wait for support reclaim or breakout hold."
+        reason = f"Only valid if price reclaims {breakout_level:.2f} and holds."
 
     if setup_type == "VWAP reclaim":
         entry = round_cent(vwap + 0.01)
         stop = round_cent(min(vwap - buffer, support_low - 0.01))
-        confirmation = f"5m candle reclaims VWAP at {vwap:.2f} and next pullback holds above VWAP."
+        confirmation = f"Active only while price holds reclaimed VWAP at {vwap:.2f} with RVOL above 1.2x."
         invalidation = f"No long if VWAP reclaim fails and price closes below {vwap:.2f}."
-    elif setup_type in {"Early breakout setup", "Halt candidate"}:
+    elif setup_type in {"PRE-BREAKOUT", "Halt candidate"}:
         entry = round_cent(breakout_level + 0.02)
         stop = round_cent(breakout_level - buffer)
-        confirmation = f"Break above {breakout_level:.2f} with volume expansion, then retest holds."
+        confirmation = f"Only valid if price reclaims {breakout_level:.2f} and holds."
         invalidation = f"No long if breakout over {breakout_level:.2f} rejects back below it."
-    elif setup_type == "Pre-momentum":
+    elif setup_type == "AFTER-HOURS RECLAIM":
+        entry = round_cent(max(current_price, vwap + 0.01, open_price + 0.01))
+        stop = round_cent(min(vwap, open_price) - buffer)
+        confirmation = f"Active only if after-hours gain stays positive and price holds above VWAP/day open."
+        invalidation = f"No long if price loses VWAP {vwap:.2f} or day open {open_price:.2f}."
+    elif setup_type == "Pullback-to-support reclaim":
         entry = round_cent(max(current_price, support_high + 0.01))
         stop = round_cent(support_low - stop_buffer)
-        confirmation = f"Hold higher lows near {support_high:.2f} and keep RVOL above 1.3x before attacking {breakout_level:.2f}."
-        invalidation = f"No long if compression breaks down below {support_low:.2f} or volume expansion fades."
+        confirmation = f"Active only if price holds reclaimed support near {support_high:.2f} with bullish candles and RVOL above 1.2x."
+        invalidation = f"No long if reclaimed support fails below {support_low:.2f}."
+    elif setup_type in {"WAIT FOR REVERSAL", "WEAK / NO LONG"}:
+        entry = round_cent(max(vwap, open_price) + 0.01)
+        stop = None
+        confirmation = "Needs reclaim above VWAP/day open before any long."
+        invalidation = f"No long while price remains below VWAP {vwap:.2f} and day open {open_price:.2f}."
     else:
         entry = round_cent(support_high + 0.01)
         stop = round_cent(support_low - stop_buffer)
-        confirmation = f"Wait for pullback into {support_low:.2f}-{support_high:.2f} or breakout over {breakout_level:.2f}."
+        confirmation = f"Only valid if price reclaims {max(support_high, vwap, open_price):.2f} and holds."
         invalidation = f"No long if price loses {support_low:.2f}."
 
     target_1 = round_cent(max(day_high, breakout_level))
     target_2 = round_cent(max(spike_high, target_1))
-    risk = entry - stop
+    risk = entry - stop if stop is not None else 0
     if risk > 0 and target_1 <= entry:
         target_1 = round_cent(entry + risk * 2)
     if risk > 0 and target_2 <= target_1:
         target_2 = round_cent(target_1 + risk * 2)
 
-    rr = rr_ratio(entry, stop, target_1)
+    rr = rr_ratio(entry, stop, target_1) if entry is not None and stop is not None and target_1 is not None else None
+    if status == "WAIT" and setup_type in {"VWAP reclaim", "Pullback-to-support reclaim", "AFTER-HOURS RECLAIM"}:
+        status = "VALID TRADE"
     if status == "VALID TRADE" and (rr is None or rr < 2):
         status = "WAIT"
         reason = "Risk/reward to Target 1 is below 1:2."
-    if relative_volume < 1.3 and not volume_spike and status == "VALID TRADE":
+        confirmation = f"Only valid if price reclaims {entry:.2f} and holds."
+    if relative_volume < 1.2 and status == "VALID TRADE":
         status = "WAIT"
-        reason = "Relative volume is below the pre-momentum trigger and no candle volume spike is present."
-    if status == "NO TRADE":
+        reason = "Relative volume is below the 1.2x minimum for a valid long."
+        confirmation = f"Only valid if price reclaims {entry:.2f} and holds with RVOL above 1.2x."
+    if strongly_red and status == "VALID TRADE":
+        status = "WAIT FOR REVERSAL"
+        reason = "Needs reclaim above VWAP/day open before any long."
+        confirmation = "Needs reclaim above VWAP/day open before any long."
+    if below_open_and_vwap and status == "VALID TRADE":
+        status = "WAIT FOR REVERSAL"
+        reason = "Price is below day open and VWAP; reclaim is not confirmed."
+        confirmation = "Needs reclaim above VWAP/day open before any long."
+    if status in {"NO TRADE", "WEAK / NO LONG"}:
         entry = stop = target_1 = target_2 = None
 
     probability = "Low"
     if status == "VALID TRADE" and rr is not None and rr >= 2:
         probability = "High" if relative_volume >= 2.5 and (volume_spike or near_high_pct <= 3.0) else "Medium"
-    elif status.startswith("WAIT") and relative_volume >= 1.5:
+    elif status.startswith("WAIT") and not strongly_red and relative_volume >= 1.5:
         probability = "Medium"
+    if strongly_red:
+        probability = "Low"
 
     score = 0.0
     score += min(relative_volume, 12) * 12
@@ -709,6 +766,14 @@ def calculate_trade_plan(row: pd.Series) -> dict[str, object]:
     score += 10 if near_vwap_reclaim else 0
     score += 10 if near_breakout else 0
     score += 20 if status == "VALID TRADE" else 5 if status.startswith("WAIT") else -20
+    if gain_pct < 0:
+        score -= 30
+    if gain_pct < -3:
+        score -= 50
+    if not price_above_open:
+        score -= 20
+    if relative_volume < 1:
+        score -= 20
     if extended_pct > 12:
         score -= min(extended_pct - 12, 30) * 1.5
     score = round(max(score, 0), 1)
@@ -761,7 +826,14 @@ def analyze_candidates(candidates_df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     df["_runner_rank"] = df["Runner Label"].astype(str).eq("HIGH POTENTIAL RUNNERS").map({True: 0, False: 1})
-    status_rank = {"VALID TRADE": 0, "WAIT": 1, "WAIT FOR PULLBACK": 2, "NO TRADE": 3}
+    status_rank = {
+        "VALID TRADE": 0,
+        "WAIT": 1,
+        "WAIT FOR PULLBACK": 2,
+        "WAIT FOR REVERSAL": 3,
+        "WEAK / NO LONG": 4,
+        "NO TRADE": 5,
+    }
     df["_status_rank"] = df["Status"].map(status_rank).fillna(9)
     return df.sort_values(["_runner_rank", "_status_rank", "Momentum Score"], ascending=[True, True, False]).drop(columns=["_runner_rank", "_status_rank"])
 
@@ -832,33 +904,6 @@ def apply_theme() -> None:
             .block-container { padding-top: 1.35rem; }
             h1, h2, h3 { color: #f8fafc; letter-spacing: 0; }
             .subtle { color: #94a3b8; font-size: 0.9rem; }
-            .setup-card {
-                background: #111827;
-                border: 1px solid #243244;
-                border-left: 4px solid #334155;
-                border-radius: 8px;
-                padding: 0.85rem 1rem;
-                margin-bottom: 0.75rem;
-            }
-            .setup-title {
-                color: #f8fafc;
-                font-size: 1.05rem;
-                font-weight: 800;
-                margin-bottom: 0.35rem;
-            }
-            .setup-meta {
-                color: #cbd5e1;
-                font-size: 0.9rem;
-                line-height: 1.5;
-            }
-            .status-pill {
-                border-radius: 8px;
-                color: white;
-                display: inline-block;
-                font-weight: 800;
-                padding: 0.25rem 0.55rem;
-                margin-right: 0.4rem;
-            }
             div[data-testid="stMetric"] {
                 background: #111827;
                 border: 1px solid #243244;
@@ -872,29 +917,32 @@ def apply_theme() -> None:
 
 
 def render_setup_card(row: pd.Series) -> None:
-    color = status_color(str(row["Status"]))
-    runner_label = str(row.get("Runner Label", "") or "")
-    runner_html = f'<span class="status-pill" style="background:#f59e0b;">{runner_label}</span>' if runner_label else ""
-    st.markdown(
-        f"""
-        <div class="setup-card" style="border-left-color:{color};">
-            <div class="setup-title">
-                {row["Ticker"]}
-                {runner_html}
-                <span class="status-pill" style="background:{color};">{row["Status"]}</span>
-            </div>
-            <div class="setup-meta">
-                Price ${fmt_price(row["Current Price"])} | Gain {float(row["Intraday Gain %"]):.2f}% |
-                RVOL {float(row["Relative Volume"]):.2f}x | Accel {float(row.get("Volume Acceleration", 0)):.2f}x |
-                Near High {float(row.get("Near High %", 0)):.2f}% | Volume {fmt_num(row["Volume"])}<br>
-                Entry {fmt_price(row["Entry"])} | Stop {fmt_price(row["Stop"])} |
-                T1 {fmt_price(row["Target 1"])} | T2 {fmt_price(row["Target 2"])} |
-                {row["Setup Type"]} | Score {row["Momentum Score"]}
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    with st.container(border=True):
+        title_cols = st.columns([0.32, 0.38, 0.30])
+        title_cols[0].markdown(f"**{row['Ticker']}**")
+        title_cols[1].markdown(status_icon(str(row["Status"])))
+        runner_label = str(row.get("Runner Label", "") or "")
+        if runner_label:
+            title_cols[2].markdown(f":orange[{runner_label}]")
+        else:
+            title_cols[2].caption(str(row["Setup Type"]))
+
+        metric_cols = st.columns(4)
+        metric_cols[0].metric("Price", f"${fmt_price(row['Current Price'])}")
+        metric_cols[1].metric("Gain", f"{float(row['Intraday Gain %']):.2f}%")
+        metric_cols[2].metric("RVOL", f"{float(row['Relative Volume']):.2f}x")
+        metric_cols[3].metric("Score", f"{row['Momentum Score']}")
+
+        signal_cols = st.columns(3)
+        signal_cols[0].caption(f"Accel {float(row.get('Volume Acceleration', 0)):.2f}x")
+        signal_cols[1].caption(f"Near high {float(row.get('Near High %', 0)):.2f}%")
+        signal_cols[2].caption(f"Volume {fmt_num(row['Volume'])}")
+
+        trade_cols = st.columns(4)
+        trade_cols[0].caption(f"Entry {fmt_price(row['Entry'])}")
+        trade_cols[1].caption(f"Stop {fmt_price(row['Stop'])}")
+        trade_cols[2].caption(f"T1 {fmt_price(row['Target 1'])}")
+        trade_cols[3].caption(f"T2 {fmt_price(row['Target 2'])}")
 
 
 def snapshot_state(state: AppState) -> dict[str, object]:
@@ -927,6 +975,12 @@ def sync_session_state(snapshot: dict[str, object]) -> None:
         "error": snapshot["error"],
     }
     st.session_state["last_update_time"] = datetime.now().isoformat(timespec="seconds")
+
+
+def remove_html_tags(value: object) -> object:
+    if isinstance(value, str):
+        return re.sub(r"<[^>]*>", "", value)
+    return value
 
 
 def render_dynamic_sections(
@@ -983,7 +1037,8 @@ def render_dynamic_sections(
         "Momentum Score",
     ]
     available_cols = [column for column in display_cols if column in top10.columns]
-    table_placeholder.dataframe(top10[available_cols], use_container_width=True, hide_index=True)
+    table_df = top10[available_cols].applymap(remove_html_tags)
+    table_placeholder.dataframe(table_df, use_container_width=True, hide_index=True)
 
     with cards_placeholder.container():
         for _, row in top10.iterrows():
@@ -994,18 +1049,17 @@ def render_dynamic_sections(
         selected_ticker = str(top10.iloc[0]["Ticker"])
 
     row = top10[top10["Ticker"].astype(str) == selected_ticker].iloc[0]
-    color = status_color(str(row["Status"]))
     with detail_placeholder.container():
-        st.markdown(f'<span class="status-pill" style="background:{color};">{row["Status"]}</span>', unsafe_allow_html=True)
+        st.markdown(status_icon(str(row["Status"])))
         trade_cols = st.columns(4)
         trade_cols[0].metric("Entry", fmt_price(row["Entry"]))
         trade_cols[1].metric("Stop", fmt_price(row["Stop"]))
         trade_cols[2].metric("Target 1", fmt_price(row["Target 1"]))
         trade_cols[3].metric("Target 2", fmt_price(row["Target 2"]))
-        st.write(f"**Confirmation:** {row['Confirmation']}")
-        st.write(f"**Invalidation:** {row['Invalidation']}")
-        st.write(f"**Why this works:** {row['Why This Works']}")
-        st.write(f"**Avoid trade:** {row['Avoid Trade']}")
+        st.write(f"**Confirmation:** {remove_html_tags(row['Confirmation'])}")
+        st.write(f"**Invalidation:** {remove_html_tags(row['Invalidation'])}")
+        st.write(f"**Why this works:** {remove_html_tags(row['Why This Works'])}")
+        st.write(f"**Avoid trade:** {remove_html_tags(row['Avoid Trade'])}")
 
 
 def main() -> None:
@@ -1018,13 +1072,8 @@ def main() -> None:
     sync_session_state(snap)
     settings: ScannerSettings = snap["settings"]  # type: ignore[assignment]
 
-    st.markdown(
-        """
-        <h1>Live Small-Cap Momentum Trade Setups</h1>
-        <div class="subtle">Background scanner runs automatically. Data is held in memory and refreshes in the browser.</div>
-        """,
-        unsafe_allow_html=True,
-    )
+    st.title("Live Small-Cap Momentum Trade Setups")
+    st.caption("Background scanner runs automatically. Data is held in memory and refreshes in the browser.")
 
     with st.sidebar:
         st.header("Controls")
