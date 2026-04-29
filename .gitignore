@@ -1,0 +1,10 @@
+
+  __pycache__/
+  .yfinance_cache/
+  *.xlsx
+  *.log
+  *.png
+  scanner.py
+  analyzer.py
+  dashboard.py
+  
