@@ -202,7 +202,7 @@ def get_us_tickers(state: AppState) -> list[str]:
     df["Ticker"] = df["Ticker"].astype(str).str.upper().str.strip()
     df["Name"] = df["Name"].fillna("").astype(str).str.lower()
     SECURITY_NAME_CACHE = dict(zip(df["Ticker"], df["Name"]))
-    df = df[df["Ticker"].map(is_valid_ticker)]
+    df = df[[is_valid_ticker(ticker) for ticker in df["Ticker"]]]
     df = df[df["ETF"].astype(str).str.upper().ne("Y")]
     df = df[df["Test Issue"].astype(str).str.upper().ne("Y")]
 
@@ -825,7 +825,10 @@ def analyze_candidates(candidates_df: pd.DataFrame) -> pd.DataFrame:
     df = pd.DataFrame(plans)
     if df.empty:
         return df
-    df["_runner_rank"] = df["Runner Label"].astype(str).eq("HIGH POTENTIAL RUNNERS").map({True: 0, False: 1})
+    if "Runner Label" in df.columns:
+        df["_runner_rank"] = np.where(df["Runner Label"].astype(str).eq("HIGH POTENTIAL RUNNERS"), 0, 1)
+    else:
+        df["_runner_rank"] = 1
     status_rank = {
         "VALID TRADE": 0,
         "WAIT": 1,
@@ -834,7 +837,10 @@ def analyze_candidates(candidates_df: pd.DataFrame) -> pd.DataFrame:
         "WEAK / NO LONG": 4,
         "NO TRADE": 5,
     }
-    df["_status_rank"] = df["Status"].map(status_rank).fillna(9)
+    if "Status" in df.columns:
+        df["_status_rank"] = df["Status"].replace(status_rank).where(df["Status"].isin(status_rank), 9)
+    else:
+        df["_status_rank"] = 9
     return df.sort_values(["_runner_rank", "_status_rank", "Momentum Score"], ascending=[True, True, False]).drop(columns=["_runner_rank", "_status_rank"])
 
 
@@ -919,30 +925,30 @@ def apply_theme() -> None:
 def render_setup_card(row: pd.Series) -> None:
     with st.container(border=True):
         title_cols = st.columns([0.32, 0.38, 0.30])
-        title_cols[0].markdown(f"**{row['Ticker']}**")
-        title_cols[1].markdown(status_icon(str(row["Status"])))
+        title_cols[0].markdown(f"**{safe_format_value(row.get('Ticker', 'N/A'))}**")
+        title_cols[1].markdown(status_icon(str(row.get("Status", "WAIT"))))
         runner_label = str(row.get("Runner Label", "") or "")
         if runner_label:
             title_cols[2].markdown(f":orange[{runner_label}]")
         else:
-            title_cols[2].caption(str(row["Setup Type"]))
+            title_cols[2].caption(str(row.get("Setup Type", "WAIT")))
 
         metric_cols = st.columns(4)
-        metric_cols[0].metric("Price", f"${fmt_price(row['Current Price'])}")
-        metric_cols[1].metric("Gain", f"{float(row['Intraday Gain %']):.2f}%")
-        metric_cols[2].metric("RVOL", f"{float(row['Relative Volume']):.2f}x")
-        metric_cols[3].metric("Score", f"{row['Momentum Score']}")
+        metric_cols[0].metric("Price", f"${fmt_price(row.get('Current Price'))}")
+        metric_cols[1].metric("Gain", f"{float(row.get('Intraday Gain %', 0)):.2f}%")
+        metric_cols[2].metric("RVOL", f"{float(row.get('Relative Volume', 0)):.2f}x")
+        metric_cols[3].metric("Score", f"{safe_format_value(row.get('Momentum Score'))}")
 
         signal_cols = st.columns(3)
         signal_cols[0].caption(f"Accel {float(row.get('Volume Acceleration', 0)):.2f}x")
         signal_cols[1].caption(f"Near high {float(row.get('Near High %', 0)):.2f}%")
-        signal_cols[2].caption(f"Volume {fmt_num(row['Volume'])}")
+        signal_cols[2].caption(f"Volume {fmt_num(row.get('Volume'))}")
 
         trade_cols = st.columns(4)
-        trade_cols[0].caption(f"Entry {fmt_price(row['Entry'])}")
-        trade_cols[1].caption(f"Stop {fmt_price(row['Stop'])}")
-        trade_cols[2].caption(f"T1 {fmt_price(row['Target 1'])}")
-        trade_cols[3].caption(f"T2 {fmt_price(row['Target 2'])}")
+        trade_cols[0].caption(f"Entry {fmt_price(row.get('Entry'))}")
+        trade_cols[1].caption(f"Stop {fmt_price(row.get('Stop'))}")
+        trade_cols[2].caption(f"T1 {fmt_price(row.get('Target 1'))}")
+        trade_cols[3].caption(f"T2 {fmt_price(row.get('Target 2'))}")
 
 
 def snapshot_state(state: AppState) -> dict[str, object]:
@@ -983,6 +989,15 @@ def remove_html_tags(value: object) -> object:
     return value
 
 
+def safe_format_value(value: object) -> object:
+    value = remove_html_tags(value)
+    if pd.isna(value):
+        return "N/A"
+    if isinstance(value, float):
+        return round(value, 2)
+    return value
+
+
 def render_dynamic_sections(
     state: AppState,
     metrics_placeholder: st.delta_generator.DeltaGenerator,
@@ -1012,12 +1027,18 @@ def render_dynamic_sections(
             st.warning(f"Last scanner error: {metrics_data['error']}")
 
     if plans_df.empty:
-        table_placeholder.info("Scanner is warming up. Results will appear automatically after the first background cycle.")
+        table_placeholder.info("No trade setups available yet. Scanner is still collecting data.")
         cards_placeholder.empty()
         detail_placeholder.empty()
         return
 
     top10 = plans_df.head(10)
+    if top10.empty:
+        table_placeholder.info("No trade setups available yet. Scanner is still collecting data.")
+        cards_placeholder.empty()
+        detail_placeholder.empty()
+        return
+
     display_cols = [
         "Runner Label",
         "Ticker",
@@ -1036,30 +1057,53 @@ def render_dynamic_sections(
         "Target 2",
         "Momentum Score",
     ]
-    available_cols = [column for column in display_cols if column in top10.columns]
-    table_df = top10[available_cols].applymap(remove_html_tags)
-    table_placeholder.dataframe(table_df, use_container_width=True, hide_index=True)
+
+    try:
+        available_cols = [col for col in display_cols if col in top10.columns]
+        if not available_cols:
+            table_placeholder.info("No trade setups available yet. Scanner is still collecting data.")
+            cards_placeholder.empty()
+            detail_placeholder.empty()
+            return
+
+        table_df = top10[available_cols].copy()
+        for col in table_df.columns:
+            table_df[col] = table_df[col].apply(safe_format_value)
+
+        table_placeholder.dataframe(table_df, use_container_width=True, hide_index=True)
+    except Exception as exc:
+        table_placeholder.warning(f"Could not format trade setup table yet: {type(exc).__name__}. Scanner is still collecting data.")
+        cards_placeholder.empty()
+        detail_placeholder.empty()
+        return
 
     with cards_placeholder.container():
         for _, row in top10.iterrows():
             render_setup_card(row)
 
     selected_ticker = st.session_state.get("selected_ticker")
+    if "Ticker" not in top10.columns:
+        detail_placeholder.info("No trade setup details available yet.")
+        return
+
     if selected_ticker not in set(top10["Ticker"].astype(str)):
         selected_ticker = str(top10.iloc[0]["Ticker"])
 
     row = top10[top10["Ticker"].astype(str) == selected_ticker].iloc[0]
     with detail_placeholder.container():
-        st.markdown(status_icon(str(row["Status"])))
+        if "Status" in top10.columns:
+            st.markdown(status_icon(str(row.get("Status", "WAIT"))))
+        else:
+            st.markdown(status_icon("WAIT"))
         trade_cols = st.columns(4)
-        trade_cols[0].metric("Entry", fmt_price(row["Entry"]))
-        trade_cols[1].metric("Stop", fmt_price(row["Stop"]))
-        trade_cols[2].metric("Target 1", fmt_price(row["Target 1"]))
-        trade_cols[3].metric("Target 2", fmt_price(row["Target 2"]))
-        st.write(f"**Confirmation:** {remove_html_tags(row['Confirmation'])}")
-        st.write(f"**Invalidation:** {remove_html_tags(row['Invalidation'])}")
-        st.write(f"**Why this works:** {remove_html_tags(row['Why This Works'])}")
-        st.write(f"**Avoid trade:** {remove_html_tags(row['Avoid Trade'])}")
+        trade_cols[0].metric("Entry", fmt_price(row.get("Entry")))
+        trade_cols[1].metric("Stop", fmt_price(row.get("Stop")))
+        trade_cols[2].metric("Target 1", fmt_price(row.get("Target 1")))
+        trade_cols[3].metric("Target 2", fmt_price(row.get("Target 2")))
+        st.write(f"**Confirmation:** {safe_format_value(row.get('Confirmation'))}")
+        st.write(f"**Invalidation:** {safe_format_value(row.get('Invalidation'))}")
+        st.write(f"**Why this works:** {safe_format_value(row.get('Why This Works'))}")
+        st.write(f"**Avoid trade:** {safe_format_value(row.get('Avoid Trade'))}")
 
 
 def main() -> None:
@@ -1110,7 +1154,7 @@ def main() -> None:
         cards_placeholder = st.empty()
 
     plans_for_selector: pd.DataFrame = st.session_state.get("trade_plans", pd.DataFrame())
-    if not plans_for_selector.empty:
+    if not plans_for_selector.empty and "Ticker" in plans_for_selector.columns:
         tickers = plans_for_selector.head(10)["Ticker"].astype(str).tolist()
         current_selected = st.session_state.get("selected_ticker")
         if current_selected in tickers:
