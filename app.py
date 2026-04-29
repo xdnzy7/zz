@@ -812,7 +812,6 @@ def render_dynamic_sections(
     selected_ticker = st.session_state.get("selected_ticker")
     if selected_ticker not in set(top10["Ticker"].astype(str)):
         selected_ticker = str(top10.iloc[0]["Ticker"])
-        st.session_state["selected_ticker"] = selected_ticker
 
     row = top10[top10["Ticker"].astype(str) == selected_ticker].iloc[0]
     color = status_color(str(row["Status"]))
@@ -884,7 +883,12 @@ def main() -> None:
     plans_for_selector: pd.DataFrame = st.session_state.get("trade_plans", pd.DataFrame())
     if not plans_for_selector.empty:
         tickers = plans_for_selector.head(10)["Ticker"].astype(str).tolist()
-        selected = st.selectbox("Open trade plan", tickers, key="selected_ticker")
+        current_selected = st.session_state.get("selected_ticker")
+        if current_selected in tickers:
+            selected_index = tickers.index(current_selected)
+        else:
+            selected_index = 0
+        st.selectbox("Open trade plan", tickers, index=selected_index, key="selected_ticker")
     else:
         st.selectbox("Open trade plan", ["Waiting for data"], disabled=True)
 
