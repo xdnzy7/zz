@@ -17,7 +17,6 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-import streamlit.components.v1 as components
 import yfinance as yf
 
 
@@ -740,6 +739,96 @@ def snapshot_state(state: AppState) -> dict[str, object]:
         }
 
 
+def sync_session_state(snapshot: dict[str, object]) -> None:
+    st.session_state["scanner_results"] = snapshot["candidates_df"]
+    st.session_state["trade_plans"] = snapshot["plans_df"]
+    st.session_state["scanner_metrics"] = {
+        "thread_alive": snapshot["thread_alive"],
+        "cycle_count": snapshot["cycle_count"],
+        "scanned_count": snapshot["scanned_count"],
+        "candidate_count": len(snapshot["candidates_df"]),  # type: ignore[arg-type]
+        "last_scan_seconds": snapshot["last_scan_seconds"],
+        "last_scan_finished": snapshot["last_scan_finished"],
+        "error": snapshot["error"],
+    }
+    st.session_state["last_update_time"] = datetime.now().isoformat(timespec="seconds")
+
+
+def render_dynamic_sections(
+    state: AppState,
+    metrics_placeholder: st.delta_generator.DeltaGenerator,
+    status_placeholder: st.delta_generator.DeltaGenerator,
+    table_placeholder: st.delta_generator.DeltaGenerator,
+    cards_placeholder: st.delta_generator.DeltaGenerator,
+    detail_placeholder: st.delta_generator.DeltaGenerator,
+) -> None:
+    snap = snapshot_state(state)
+    sync_session_state(snap)
+
+    metrics_data = st.session_state["scanner_metrics"]
+    plans_df: pd.DataFrame = st.session_state["trade_plans"]
+    candidates_df: pd.DataFrame = st.session_state["scanner_results"]
+
+    with metrics_placeholder.container():
+        metrics = st.columns(5)
+        metrics[0].metric("Scanner", "RUNNING" if metrics_data["thread_alive"] else "STOPPED")
+        metrics[1].metric("Cycles", f"{int(metrics_data['cycle_count']):,}")
+        metrics[2].metric("Scanned", f"{int(metrics_data['scanned_count']):,}")
+        metrics[3].metric("Candidates", f"{len(candidates_df):,}")
+        metrics[4].metric("Last Scan", f"{float(metrics_data['last_scan_seconds']):.1f}s")
+
+    with status_placeholder.container():
+        st.caption(f"Last updated: {st.session_state['last_update_time']} | Last scan finished: {metrics_data['last_scan_finished'] or 'Starting...'}")
+        if metrics_data["error"]:
+            st.warning(f"Last scanner error: {metrics_data['error']}")
+
+    if plans_df.empty:
+        table_placeholder.info("Scanner is warming up. Results will appear automatically after the first background cycle.")
+        cards_placeholder.empty()
+        detail_placeholder.empty()
+        return
+
+    top10 = plans_df.head(10)
+    display_cols = [
+        "Ticker",
+        "Status",
+        "Setup Type",
+        "Current Price",
+        "Intraday Gain %",
+        "Relative Volume",
+        "Entry",
+        "Stop",
+        "Target 1",
+        "Target 2",
+        "Momentum Score",
+    ]
+    available_cols = [column for column in display_cols if column in top10.columns]
+    table_placeholder.dataframe(top10[available_cols], use_container_width=True, hide_index=True)
+
+    with cards_placeholder.container():
+        for _, row in top10.iterrows():
+            render_setup_card(row)
+
+    selected_ticker = st.session_state.get("selected_ticker")
+    if selected_ticker not in set(top10["Ticker"].astype(str)):
+        selected_ticker = str(top10.iloc[0]["Ticker"])
+        st.session_state["selected_ticker"] = selected_ticker
+
+    row = top10[top10["Ticker"].astype(str) == selected_ticker].iloc[0]
+    color = status_color(str(row["Status"]))
+    with detail_placeholder.container():
+        st.markdown(f'<span class="status-pill" style="background:{color};">{row["Status"]}</span>', unsafe_allow_html=True)
+        trade_cols = st.columns(4)
+        trade_cols[0].metric("Entry", fmt_price(row["Entry"]))
+        trade_cols[1].metric("Stop", fmt_price(row["Stop"]))
+        trade_cols[2].metric("Target 1", fmt_price(row["Target 1"]))
+        trade_cols[3].metric("Target 2", fmt_price(row["Target 2"]))
+        st.write(f"**Confirmation:** {row['Confirmation']}")
+        st.write(f"**Invalidation:** {row['Invalidation']}")
+        st.write(f"**Why this works:** {row['Why This Works']}")
+        st.write(f"**Avoid trade:** {row['Avoid Trade']}")
+
+
 def main() -> None:
     st.set_page_config(page_title="Live Momentum Trade Setups", layout="wide")
     apply_theme()
@@ -747,6 +836,7 @@ def main() -> None:
     state = get_state()
     ensure_scanner_running(state)
     snap = snapshot_state(state)
+    sync_session_state(snap)
     settings: ScannerSettings = snap["settings"]  # type: ignore[assignment]
 
     st.markdown(
@@ -764,8 +854,9 @@ def main() -> None:
         max_tickers = st.slider("Tickers per scan", min_value=100, max_value=600, value=int(settings.max_tickers), step=50)
         min_volume = st.number_input("Minimum volume", min_value=0, value=int(settings.min_volume), step=25_000)
         max_workers = st.slider("Workers", min_value=10, max_value=25, value=int(settings.max_workers), step=1)
-        auto_refresh = st.toggle("Auto refresh UI", value=True)
-        refresh_seconds = st.slider("UI refresh seconds", min_value=3, max_value=30, value=5, step=1)
+        live_updates = st.toggle("Live placeholder updates", value=True)
+        pause_updates = st.toggle("Pause Updates", value=False)
+        ui_update_seconds = st.slider("UI update seconds", min_value=1, max_value=10, value=2, step=1)
 
         new_settings = ScannerSettings(
             fast_mode=fast_mode,
@@ -777,75 +868,47 @@ def main() -> None:
 
         if st.button("Restart scanner", type="primary", use_container_width=True):
             restart_scanner(state, new_settings)
-            st.rerun()
 
         with state.lock:
             state.settings = new_settings
 
-    plans_df: pd.DataFrame = snap["plans_df"]  # type: ignore[assignment]
-    candidates_df: pd.DataFrame = snap["candidates_df"]  # type: ignore[assignment]
-
-    metrics = st.columns(5)
-    metrics[0].metric("Scanner", "RUNNING" if snap["thread_alive"] else "STOPPED")
-    metrics[1].metric("Cycles", f"{int(snap['cycle_count']):,}")
-    metrics[2].metric("Scanned", f"{int(snap['scanned_count']):,}")
-    metrics[3].metric("Candidates", f"{len(candidates_df):,}")
-    metrics[4].metric("Last Scan", f"{float(snap['last_scan_seconds']):.1f}s")
-
-    st.caption(f"Last finished: {snap['last_scan_finished'] or 'Starting...'}")
-    if snap["error"]:
-        st.warning(f"Last scanner error: {snap['error']}")
-
+    metrics_placeholder = st.empty()
+    status_placeholder = st.empty()
     st.subheader("Top 10 Momentum Stocks")
-    if plans_df.empty:
-        st.info("Scanner is warming up. Results will appear automatically after the first background cycle.")
+    table_col, cards_col = st.columns([0.58, 0.42])
+    with table_col:
+        table_placeholder = st.empty()
+    with cards_col:
+        cards_placeholder = st.empty()
+
+    plans_for_selector: pd.DataFrame = st.session_state.get("trade_plans", pd.DataFrame())
+    if not plans_for_selector.empty:
+        tickers = plans_for_selector.head(10)["Ticker"].astype(str).tolist()
+        selected = st.selectbox("Open trade plan", tickers, key="selected_ticker")
     else:
-        top10 = plans_df.head(10)
-        left, right = st.columns([0.58, 0.42])
-        with left:
-            display_cols = [
-                "Ticker",
-                "Status",
-                "Setup Type",
-                "Current Price",
-                "Intraday Gain %",
-                "Relative Volume",
-                "Entry",
-                "Stop",
-                "Target 1",
-                "Target 2",
-                "Momentum Score",
-            ]
-            st.dataframe(top10[display_cols], use_container_width=True, hide_index=True)
-        with right:
-            for _, row in top10.iterrows():
-                render_setup_card(row)
+        st.selectbox("Open trade plan", ["Waiting for data"], disabled=True)
 
-        selected = st.selectbox("Open trade plan", top10["Ticker"].tolist())
-        row = top10[top10["Ticker"] == selected].iloc[0]
-        color = status_color(str(row["Status"]))
-        st.markdown(f'<span class="status-pill" style="background:{color};">{row["Status"]}</span>', unsafe_allow_html=True)
-        trade_cols = st.columns(4)
-        trade_cols[0].metric("Entry", fmt_price(row["Entry"]))
-        trade_cols[1].metric("Stop", fmt_price(row["Stop"]))
-        trade_cols[2].metric("Target 1", fmt_price(row["Target 1"]))
-        trade_cols[3].metric("Target 2", fmt_price(row["Target 2"]))
-        st.write(f"**Confirmation:** {row['Confirmation']}")
-        st.write(f"**Invalidation:** {row['Invalidation']}")
-        st.write(f"**Why this works:** {row['Why This Works']}")
-        st.write(f"**Avoid trade:** {row['Avoid Trade']}")
+    detail_placeholder = st.empty()
+    render_dynamic_sections(
+        state,
+        metrics_placeholder,
+        status_placeholder,
+        table_placeholder,
+        cards_placeholder,
+        detail_placeholder,
+    )
 
-    if auto_refresh:
-        components.html(
-            f"""
-            <script>
-                setTimeout(function() {{
-                    window.parent.location.reload();
-                }}, {int(refresh_seconds) * 1000});
-            </script>
-            """,
-            height=0,
-        )
+    if live_updates and not pause_updates:
+        while True:
+            render_dynamic_sections(
+                state,
+                metrics_placeholder,
+                status_placeholder,
+                table_placeholder,
+                cards_placeholder,
+                detail_placeholder,
+            )
+            time.sleep(ui_update_seconds)
 
 
 if __name__ == "__main__":
