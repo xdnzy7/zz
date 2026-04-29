@@ -593,6 +593,12 @@ def rr_ratio(entry: float, stop: float, target: float) -> Optional[float]:
     return reward / risk
 
 
+def price_distance_pct(current_price: float, entry: Optional[float]) -> float:
+    if entry is None or entry <= 0:
+        return 999.0
+    return abs(current_price - entry) / entry * 100
+
+
 def calculate_trade_plan(row: pd.Series) -> dict[str, object]:
     ticker = str(row["Ticker"]).upper()
     current_price = round_cent(get_value(row, "Current Price"))
@@ -633,12 +639,13 @@ def calculate_trade_plan(row: pd.Series) -> dict[str, object]:
     vwap_reclaim_confirmed = price_above_vwap and distance_to_vwap_pct <= 2.5 and strong_volume
     after_hours_reclaim = after_hours_gain_pct > 0 and current_price >= min(open_price, vwap) and strong_volume
     bullish_momentum_gate = gain_pct >= 0 or price_above_open or vwap_reclaim_confirmed or after_hours_reclaim
+    bearish_momentum = gain_pct < -2
     strongly_red = gain_pct < -3
     below_open_and_vwap = current_price < open_price and current_price < vwap
     recent_bounce_reclaim = near_support and (higher_lows or volume_spike or volume_acceleration >= 1.5) and bullish_momentum_gate
     near_vwap_reclaim = vwap_reclaim_confirmed
 
-    if strongly_red:
+    if bearish_momentum:
         setup_type = "WEAK / NO LONG"
     elif below_open_and_vwap:
         setup_type = "WAIT FOR REVERSAL"
@@ -664,7 +671,7 @@ def calculate_trade_plan(row: pd.Series) -> dict[str, object]:
     buffer = max(round_cent(current_price * 0.015), 0.02)
     stop_buffer = max(round_cent(current_price * 0.025), 0.03)
 
-    if strongly_red:
+    if bearish_momentum:
         status = "WAIT FOR REVERSAL"
         reason = "Needs reclaim above VWAP/day open before any long."
     elif below_open_and_vwap:
@@ -723,8 +730,35 @@ def calculate_trade_plan(row: pd.Series) -> dict[str, object]:
         target_2 = round_cent(target_1 + risk * 2)
 
     rr = rr_ratio(entry, stop, target_1) if entry is not None and stop is not None and target_1 is not None else None
+    entry_distance_pct = price_distance_pct(current_price, entry)
+    data_consistent = entry_distance_pct <= 20
+    price_near_entry = entry_distance_pct <= 10
+
+    if not data_consistent:
+        status = "INVALID DATA"
+        setup_type = "INVALID DATA"
+        reason = f"Current price is {entry_distance_pct:.1f}% away from planned entry, so this setup is based on stale or inconsistent data."
+        confirmation = "Refresh scanner data before considering any trade."
+        invalidation = "Trade plan hidden because current price and entry are inconsistent."
+    elif current_price < support_low:
+        status = "NO TRADE"
+        reason = f"Price is below support low at {support_low:.2f}; long structure is broken."
+        confirmation = f"No long while price is below support low {support_low:.2f}."
+    elif bearish_momentum:
+        status = "WAIT FOR REVERSAL"
+        reason = "Needs reclaim above VWAP/day open before any long."
+        confirmation = "Needs reclaim above VWAP/day open before any long."
+    elif not price_near_entry:
+        status = "WAIT"
+        reason = f"Current price is {entry_distance_pct:.1f}% away from planned entry; wait for price to get within 10% of entry."
+        confirmation = f"Only valid if price reclaims {entry:.2f} and holds near the trigger."
+
     if status == "WAIT" and setup_type in {"VWAP reclaim", "Pullback-to-support reclaim", "AFTER-HOURS RECLAIM"}:
         status = "VALID TRADE"
+    if status == "VALID TRADE" and not (price_near_entry and current_price >= support_low and data_consistent and gain_pct >= 0):
+        status = "WAIT FOR REVERSAL" if bearish_momentum else "WAIT"
+        reason = "Valid-trade gate failed: price must be near entry, above support, data-consistent, and non-negative momentum."
+        confirmation = f"Only valid if price holds above {support_low:.2f} and trades near entry {entry:.2f}."
     if status == "VALID TRADE" and (rr is None or rr < 2):
         status = "WAIT"
         reason = "Risk/reward to Target 1 is below 1:2."
@@ -733,7 +767,7 @@ def calculate_trade_plan(row: pd.Series) -> dict[str, object]:
         status = "WAIT"
         reason = "Relative volume is below the 1.2x minimum for a valid long."
         confirmation = f"Only valid if price reclaims {entry:.2f} and holds with RVOL above 1.2x."
-    if strongly_red and status == "VALID TRADE":
+    if bearish_momentum and status == "VALID TRADE":
         status = "WAIT FOR REVERSAL"
         reason = "Needs reclaim above VWAP/day open before any long."
         confirmation = "Needs reclaim above VWAP/day open before any long."
@@ -741,15 +775,15 @@ def calculate_trade_plan(row: pd.Series) -> dict[str, object]:
         status = "WAIT FOR REVERSAL"
         reason = "Price is below day open and VWAP; reclaim is not confirmed."
         confirmation = "Needs reclaim above VWAP/day open before any long."
-    if status in {"NO TRADE", "WEAK / NO LONG"}:
+    if status in {"NO TRADE", "WEAK / NO LONG", "INVALID DATA"}:
         entry = stop = target_1 = target_2 = None
 
     probability = "Low"
     if status == "VALID TRADE" and rr is not None and rr >= 2:
         probability = "High" if relative_volume >= 2.5 and (volume_spike or near_high_pct <= 3.0) else "Medium"
-    elif status.startswith("WAIT") and not strongly_red and relative_volume >= 1.5:
+    elif status.startswith("WAIT") and not bearish_momentum and relative_volume >= 1.5:
         probability = "Medium"
-    if strongly_red:
+    if bearish_momentum or status == "INVALID DATA":
         probability = "Low"
 
     score = 0.0
@@ -801,6 +835,9 @@ def calculate_trade_plan(row: pd.Series) -> dict[str, object]:
         "Risk/Reward": rr_text,
         "Probability": probability,
         "Momentum Score": score,
+        "Entry Distance %": round(entry_distance_pct, 2),
+        "Data Consistent": data_consistent,
+        "Price Near Entry": price_near_entry,
         "Runner Label": runner_label,
         "Near High %": round(near_high_pct, 2),
         "Volume Acceleration": round(volume_acceleration, 2),
@@ -835,7 +872,8 @@ def analyze_candidates(candidates_df: pd.DataFrame) -> pd.DataFrame:
         "WAIT FOR PULLBACK": 2,
         "WAIT FOR REVERSAL": 3,
         "WEAK / NO LONG": 4,
-        "NO TRADE": 5,
+        "INVALID DATA": 5,
+        "NO TRADE": 6,
     }
     if "Status" in df.columns:
         df["_status_rank"] = df["Status"].replace(status_rank).where(df["Status"].isin(status_rank), 9)
@@ -1056,6 +1094,9 @@ def render_dynamic_sections(
         "Target 1",
         "Target 2",
         "Momentum Score",
+        "Entry Distance %",
+        "Data Consistent",
+        "Price Near Entry",
     ]
 
     try:
