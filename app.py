@@ -52,6 +52,8 @@ FALLBACK_TICKERS = [
     "PLUG",
 ]
 
+SECURITY_NAME_CACHE: dict[str, str] = {}
+
 
 @dataclass
 class ScannerSettings:
@@ -60,8 +62,11 @@ class ScannerSettings:
     min_price: float = 0.50
     max_price: float = 20.00
     min_volume: int = 100_000
-    min_gain_pct: float = 1.0
-    min_relative_volume: float = 1.0
+    min_gain_pct: float = 0.0
+    min_relative_volume: float = 1.3
+    near_high_threshold_pct: float = 3.0
+    volume_acceleration_threshold: float = 1.5
+    halt_spike_threshold_pct: float = 15.0
     max_tickers: int = 400
     active_movers_count: int = 200
     explore_tickers_count: int = 250
@@ -158,6 +163,7 @@ def safe_request_text(url: str, timeout: int = 5) -> str:
 
 
 def get_us_tickers(state: AppState) -> list[str]:
+    global SECURITY_NAME_CACHE
     now = time.monotonic()
     with state.lock:
         if state.universe_cache and now - state.universe_cache[0] <= 900:
@@ -187,6 +193,7 @@ def get_us_tickers(state: AppState) -> list[str]:
     df = pd.concat(frames, ignore_index=True).drop_duplicates(subset=["Ticker"])
     df["Ticker"] = df["Ticker"].astype(str).str.upper().str.strip()
     df["Name"] = df["Name"].fillna("").astype(str).str.lower()
+    SECURITY_NAME_CACHE = dict(zip(df["Ticker"], df["Name"]))
     df = df[df["Ticker"].map(is_valid_ticker)]
     df = df[df["ETF"].astype(str).str.upper().ne("Y")]
     df = df[df["Test Issue"].astype(str).str.upper().ne("Y")]
@@ -333,12 +340,83 @@ def estimate_relative_volume(volume: int, regular: pd.DataFrame) -> float:
     return projected / baseline
 
 
-def position_score(gain_pct: float, rvol: float, near_high_pct: float, above_vwap_pct: float) -> float:
-    breakout_score = max(0.0, 3.0 - near_high_pct) * 6
+def detect_volume_acceleration(regular: pd.DataFrame, threshold: float) -> tuple[float, bool]:
+    if regular.empty or len(regular) < 5 or "Volume" not in regular:
+        return 0.0, False
+    last_two_avg = float(regular["Volume"].tail(2).mean())
+    previous = regular["Volume"].iloc[:-2].tail(12)
+    previous_avg = float(previous.mean()) if not previous.empty else 0.0
+    if previous_avg <= 0:
+        return 0.0, False
+    ratio = last_two_avg / previous_avg
+    return round(ratio, 2), ratio >= threshold
+
+
+def detect_price_compression(regular: pd.DataFrame, day_high: float, current_price: float) -> tuple[float, bool]:
+    if regular.empty or len(regular) < 5 or current_price <= 0:
+        return 100.0, False
+    recent = regular.tail(8)
+    recent_high = float(recent["High"].max())
+    recent_low = float(recent["Low"].min())
+    compression_pct = ((recent_high - recent_low) / current_price) * 100
+    near_high_pct = ((day_high - current_price) / current_price) * 100
+    return round(compression_pct, 2), compression_pct <= 4.0 and near_high_pct <= 3.0
+
+
+def detect_higher_lows(regular: pd.DataFrame) -> bool:
+    if regular.empty or len(regular) < 6:
+        return False
+    lows = regular["Low"].tail(6).reset_index(drop=True)
+    early_low = float(lows.iloc[:3].min())
+    late_low = float(lows.iloc[3:].min())
+    return late_low > early_low and float(lows.iloc[-1]) >= float(lows.iloc[-3])
+
+
+def detect_halt_spike(regular: pd.DataFrame, current_price: float, threshold_pct: float) -> bool:
+    if regular.empty or len(regular) < 3 or current_price <= 0:
+        return False
+    recent = regular.tail(4)
+    recent_low = float(recent["Low"].min())
+    recent_high = max(float(recent["High"].max()), current_price)
+    move_pct = ((recent_high - recent_low) / recent_low) * 100 if recent_low > 0 else 0.0
+    return move_pct >= threshold_pct
+
+
+def has_spac_low_float_boost(ticker: str) -> bool:
+    name = SECURITY_NAME_CACHE.get(str(ticker).upper(), "").lower()
+    return any(term in name for term in ("acquisition", "capital", "holdings"))
+
+
+def position_score(
+    rvol: float,
+    near_high_pct: float,
+    volume_acceleration: float,
+    compression_pct: float,
+    tight_consolidation: bool,
+    higher_lows: bool,
+    halt_candidate: bool,
+    spac_boost: bool,
+    above_vwap_pct: float,
+) -> float:
+    rvol_score = min(max(rvol, 0.0), 12.0) * 12
+    proximity_score = max(0.0, 3.0 - near_high_pct) * 14
+    acceleration_score = min(max(volume_acceleration, 0.0), 5.0) * 10
+    compression_score = max(0.0, 5.0 - compression_pct) * 8
+    structure_score = (18 if tight_consolidation else 0) + (14 if higher_lows else 0)
+    runner_score = 18 if halt_candidate else 0
+    spac_score = 10 if spac_boost else 0
     vwap_score = max(0.0, min(above_vwap_pct, 5.0)) * 2
-    gain_score = max(0.0, min(gain_pct, 20.0)) * 1.5
-    rvol_score = max(0.0, min(rvol, 10.0)) * 8
-    return round(breakout_score + vwap_score + gain_score + rvol_score, 2)
+    return round(
+        rvol_score
+        + proximity_score
+        + acceleration_score
+        + compression_score
+        + structure_score
+        + runner_score
+        + spac_score
+        + vwap_score,
+        2,
+    )
 
 
 def extract_candidate(ticker: str, state: AppState, settings: ScannerSettings) -> Optional[dict[str, object]]:
@@ -367,22 +445,47 @@ def extract_candidate(ticker: str, state: AppState, settings: ScannerSettings) -
     gain_pct = ((current_price - previous_close) / previous_close) * 100 if previous_close > 0 else 0.0
     relative_volume = estimate_relative_volume(volume, regular)
     near_high_pct = ((day_high - current_price) / current_price) * 100 if current_price > 0 else 100.0
+    volume_acceleration, volume_spike = detect_volume_acceleration(regular, settings.volume_acceleration_threshold)
+    compression_pct, tight_consolidation = detect_price_compression(regular, day_high, current_price)
+    higher_lows = detect_higher_lows(regular)
+    halt_candidate = detect_halt_spike(regular, current_price, settings.halt_spike_threshold_pct)
+    spac_boost = has_spac_low_float_boost(ticker)
+    pre_breakout_setup = tight_consolidation or higher_lows
     vwap = calculate_vwap(regular)
     above_vwap_pct = ((current_price - vwap) / vwap) * 100 if vwap and not np.isnan(vwap) and vwap > 0 else 0.0
 
-    early_momentum = gain_pct >= 1.0 or relative_volume >= 1.2 or near_high_pct <= 3.0
+    early_momentum = (
+        relative_volume >= settings.min_relative_volume
+        or near_high_pct <= settings.near_high_threshold_pct
+        or volume_spike
+        or pre_breakout_setup
+        or halt_candidate
+    )
+    if not early_momentum:
+        return None
+
     scan_reason: list[str] = []
+    if near_high_pct <= settings.near_high_threshold_pct and (tight_consolidation or higher_lows):
+        scan_reason.append("early breakout setup")
     if early_momentum:
-        scan_reason.append("early momentum")
-    if relative_volume >= 1.5:
+        scan_reason.append("pre-momentum")
+    if relative_volume >= settings.min_relative_volume:
+        scan_reason.append(f"RVOL {relative_volume:.2f}x")
+    if volume_spike:
         scan_reason.append("volume expansion")
-    elif relative_volume >= settings.min_relative_volume:
-        scan_reason.append(f"rel vol {relative_volume:.2f}x")
-    if near_high_pct <= 3.0:
-        scan_reason.append("near breakout")
+    if near_high_pct <= settings.near_high_threshold_pct:
+        scan_reason.append("near high pressure")
+    if tight_consolidation:
+        scan_reason.append("tight consolidation")
+    if higher_lows:
+        scan_reason.append("higher lows")
+    if halt_candidate:
+        scan_reason.append("halt candidate")
+    if spac_boost:
+        scan_reason.append("SPAC/low-float boost")
     if current_price >= vwap and day_low <= vwap:
         scan_reason.append("vwap reclaim setup")
-    if gain_pct >= settings.min_gain_pct:
+    if settings.min_gain_pct > 0 and gain_pct >= settings.min_gain_pct:
         scan_reason.append(f"gain {gain_pct:.1f}%")
     scan_reason.append(f"volume {volume:,}")
 
@@ -398,10 +501,29 @@ def extract_candidate(ticker: str, state: AppState, settings: ScannerSettings) -
         "Average Volume": int(float(regular["Volume"].tail(20).mean()) * 78),
         "Relative Volume": round(relative_volume, 2),
         "Near High %": round(near_high_pct, 2),
+        "Volume Acceleration": volume_acceleration,
+        "Volume Spike": volume_spike,
+        "Compression %": compression_pct,
+        "Tight Consolidation": tight_consolidation,
+        "Higher Lows": higher_lows,
+        "Pre-Breakout Setup": pre_breakout_setup,
+        "Halt Candidate": halt_candidate,
+        "SPAC Low Float Boost": spac_boost,
+        "Runner Label": "",
         "VWAP": vwap,
         "Above VWAP %": round(above_vwap_pct, 2),
         "Early Momentum": early_momentum,
-        "Momentum Score": position_score(gain_pct, relative_volume, near_high_pct, above_vwap_pct),
+        "Momentum Score": position_score(
+            relative_volume,
+            near_high_pct,
+            volume_acceleration,
+            compression_pct,
+            tight_consolidation,
+            higher_lows,
+            halt_candidate,
+            spac_boost,
+            above_vwap_pct,
+        ),
         "Timestamp": datetime.now().isoformat(timespec="seconds"),
         "Scan Reason": ", ".join(scan_reason),
     }
@@ -429,9 +551,19 @@ def scan_market(state: AppState, settings: ScannerSettings) -> tuple[pd.DataFram
     if not df.empty:
         df = df.drop_duplicates(subset=["Ticker"], keep="last")
         df = df.sort_values(
-            ["Early Momentum", "Momentum Score", "Relative Volume", "Near High %", "Volume", "Intraday Gain %"],
-            ascending=[False, False, False, True, False, False],
+            [
+                "Early Momentum",
+                "Relative Volume",
+                "Near High %",
+                "Volume Acceleration",
+                "Compression %",
+                "Momentum Score",
+                "Volume",
+            ],
+            ascending=[False, False, True, False, True, False, False],
         ).head(settings.output_limit)
+        df["Runner Label"] = ""
+        df.iloc[: min(3, len(df)), df.columns.get_loc("Runner Label")] = "HIGH POTENTIAL RUNNERS"
     return df, skipped, len(tickers)
 
 
@@ -459,6 +591,16 @@ def calculate_trade_plan(row: pd.Series) -> dict[str, object]:
     gain_pct = get_value(row, "Intraday Gain %")
     volume = int(get_value(row, "Volume"))
     relative_volume = get_value(row, "Relative Volume")
+    near_high_pct = get_value(row, "Near High %", 100.0)
+    volume_acceleration = get_value(row, "Volume Acceleration")
+    compression_pct = get_value(row, "Compression %", 100.0)
+    volume_spike = bool(row.get("Volume Spike", False))
+    tight_consolidation = bool(row.get("Tight Consolidation", False))
+    higher_lows = bool(row.get("Higher Lows", False))
+    pre_breakout_setup = bool(row.get("Pre-Breakout Setup", False))
+    halt_candidate = bool(row.get("Halt Candidate", False))
+    spac_boost = bool(row.get("SPAC Low Float Boost", False))
+    runner_label = str(row.get("Runner Label", "") or "")
 
     support_low = round_cent(max(day_low, current_price * 0.94))
     support_high = round_cent(max(support_low + 0.01, current_price * 0.975))
@@ -474,14 +616,20 @@ def calculate_trade_plan(row: pd.Series) -> dict[str, object]:
     near_breakout = -1.0 <= distance_to_breakout_pct <= 2.5
     near_vwap_reclaim = current_price >= vwap and distance_to_vwap_pct <= 2.5
 
-    if current_price < support_low:
+    if halt_candidate:
+        setup_type = "Halt candidate"
+    elif pre_breakout_setup and near_breakout:
+        setup_type = "Early breakout setup"
+    elif pre_breakout_setup:
+        setup_type = "Pre-momentum"
+    elif current_price < support_low:
         setup_type = "Fake breakdown reclaim"
     elif near_support:
         setup_type = "Pullback-to-support reclaim"
     elif near_vwap_reclaim:
         setup_type = "VWAP reclaim"
     elif near_breakout:
-        setup_type = "Breakout and hold"
+        setup_type = "Early breakout setup"
     elif extended_pct > 12:
         setup_type = "Wait for pullback"
     else:
@@ -495,7 +643,7 @@ def calculate_trade_plan(row: pd.Series) -> dict[str, object]:
     if current_price < support_low:
         status = "NO TRADE"
         reason = f"Price is below support low at {support_low:.2f}; long structure is broken."
-    elif extended_pct > 12 and setup_type != "Breakout and hold":
+    elif extended_pct > 12 and setup_type not in {"Early breakout setup", "Halt candidate"}:
         status = "WAIT FOR PULLBACK"
         reason = f"Price is {extended_pct:.1f}% above support, so buying now would chase the move."
     elif support_high < current_price < breakout_level and not near_vwap_reclaim:
@@ -507,11 +655,16 @@ def calculate_trade_plan(row: pd.Series) -> dict[str, object]:
         stop = round_cent(min(vwap - buffer, support_low - 0.01))
         confirmation = f"5m candle reclaims VWAP at {vwap:.2f} and next pullback holds above VWAP."
         invalidation = f"No long if VWAP reclaim fails and price closes below {vwap:.2f}."
-    elif setup_type == "Breakout and hold":
+    elif setup_type in {"Early breakout setup", "Halt candidate"}:
         entry = round_cent(breakout_level + 0.02)
         stop = round_cent(breakout_level - buffer)
         confirmation = f"Break above {breakout_level:.2f} with volume expansion, then retest holds."
         invalidation = f"No long if breakout over {breakout_level:.2f} rejects back below it."
+    elif setup_type == "Pre-momentum":
+        entry = round_cent(max(current_price, support_high + 0.01))
+        stop = round_cent(support_low - stop_buffer)
+        confirmation = f"Hold higher lows near {support_high:.2f} and keep RVOL above 1.3x before attacking {breakout_level:.2f}."
+        invalidation = f"No long if compression breaks down below {support_low:.2f} or volume expansion fades."
     else:
         entry = round_cent(support_high + 0.01)
         stop = round_cent(support_low - stop_buffer)
@@ -530,23 +683,29 @@ def calculate_trade_plan(row: pd.Series) -> dict[str, object]:
     if status == "VALID TRADE" and (rr is None or rr < 2):
         status = "WAIT"
         reason = "Risk/reward to Target 1 is below 1:2."
-    if relative_volume < 1.2 and status == "VALID TRADE":
+    if relative_volume < 1.3 and not volume_spike and status == "VALID TRADE":
         status = "WAIT"
-        reason = "Relative volume is too weak for a valid momentum entry."
+        reason = "Relative volume is below the pre-momentum trigger and no candle volume spike is present."
     if status == "NO TRADE":
         entry = stop = target_1 = target_2 = None
 
     probability = "Low"
     if status == "VALID TRADE" and rr is not None and rr >= 2:
-        probability = "High" if relative_volume >= 4 and gain_pct >= 10 else "Medium"
-    elif status.startswith("WAIT") and relative_volume >= 2:
+        probability = "High" if relative_volume >= 2.5 and (volume_spike or near_high_pct <= 3.0) else "Medium"
+    elif status.startswith("WAIT") and relative_volume >= 1.5:
         probability = "Medium"
 
     score = 0.0
-    score += min(max(gain_pct, 0), 80) * 0.7
-    score += min(relative_volume, 12) * 7
+    score += min(relative_volume, 12) * 12
+    score += max(0.0, 3.0 - near_high_pct) * 14
+    score += min(max(volume_acceleration, 0), 5) * 10
+    score += max(0.0, 5.0 - compression_pct) * 8
     score += min(volume / 1_000_000, 10) * 4
     score += min(rr or 0, 6) * 8
+    score += 18 if tight_consolidation else 0
+    score += 14 if higher_lows else 0
+    score += 18 if halt_candidate else 0
+    score += 10 if spac_boost else 0
     score += 10 if near_vwap_reclaim else 0
     score += 10 if near_breakout else 0
     score += 20 if status == "VALID TRADE" else 5 if status.startswith("WAIT") else -20
@@ -554,7 +713,11 @@ def calculate_trade_plan(row: pd.Series) -> dict[str, object]:
         score -= min(extended_pct - 12, 30) * 1.5
     score = round(max(score, 0), 1)
 
-    why = reason or f"{ticker} has {gain_pct:.1f}% momentum, {relative_volume:.2f}x relative volume, and a {setup_type.lower()} structure."
+    why = reason or (
+        f"{ticker} is showing pre-breakout behavior: RVOL {relative_volume:.2f}x, "
+        f"{near_high_pct:.2f}% from the day high, {volume_acceleration:.2f}x candle volume acceleration, "
+        f"and {compression_pct:.2f}% recent price compression."
+    )
     avoid = f"Avoid if price loses {support_low:.2f}, relative volume fades, price gets more than 12% extended, or breakout level {breakout_level:.2f} rejects."
     rr_text = "N/A" if entry is None or stop is None or target_1 is None or rr is None else f"1:{rr:.2f}"
 
@@ -573,6 +736,13 @@ def calculate_trade_plan(row: pd.Series) -> dict[str, object]:
         "Risk/Reward": rr_text,
         "Probability": probability,
         "Momentum Score": score,
+        "Runner Label": runner_label,
+        "Near High %": round(near_high_pct, 2),
+        "Volume Acceleration": round(volume_acceleration, 2),
+        "Compression %": round(compression_pct, 2),
+        "Volume Spike": volume_spike,
+        "Pre-Breakout Setup": pre_breakout_setup,
+        "Halt Candidate": halt_candidate,
         "Confirmation": confirmation,
         "Invalidation": invalidation,
         "Why This Works": why,
@@ -590,9 +760,10 @@ def analyze_candidates(candidates_df: pd.DataFrame) -> pd.DataFrame:
     df = pd.DataFrame(plans)
     if df.empty:
         return df
+    df["_runner_rank"] = df["Runner Label"].astype(str).eq("HIGH POTENTIAL RUNNERS").map({True: 0, False: 1})
     status_rank = {"VALID TRADE": 0, "WAIT": 1, "WAIT FOR PULLBACK": 2, "NO TRADE": 3}
     df["_status_rank"] = df["Status"].map(status_rank).fillna(9)
-    return df.sort_values(["_status_rank", "Momentum Score"], ascending=[True, False]).drop(columns=["_status_rank"])
+    return df.sort_values(["_runner_rank", "_status_rank", "Momentum Score"], ascending=[True, True, False]).drop(columns=["_runner_rank", "_status_rank"])
 
 
 def scanner_loop(state: AppState) -> None:
@@ -702,16 +873,20 @@ def apply_theme() -> None:
 
 def render_setup_card(row: pd.Series) -> None:
     color = status_color(str(row["Status"]))
+    runner_label = str(row.get("Runner Label", "") or "")
+    runner_html = f'<span class="status-pill" style="background:#f59e0b;">{runner_label}</span>' if runner_label else ""
     st.markdown(
         f"""
         <div class="setup-card" style="border-left-color:{color};">
             <div class="setup-title">
                 {row["Ticker"]}
+                {runner_html}
                 <span class="status-pill" style="background:{color};">{row["Status"]}</span>
             </div>
             <div class="setup-meta">
                 Price ${fmt_price(row["Current Price"])} | Gain {float(row["Intraday Gain %"]):.2f}% |
-                RVOL {float(row["Relative Volume"]):.2f}x | Volume {fmt_num(row["Volume"])}<br>
+                RVOL {float(row["Relative Volume"]):.2f}x | Accel {float(row.get("Volume Acceleration", 0)):.2f}x |
+                Near High {float(row.get("Near High %", 0)):.2f}% | Volume {fmt_num(row["Volume"])}<br>
                 Entry {fmt_price(row["Entry"])} | Stop {fmt_price(row["Stop"])} |
                 T1 {fmt_price(row["Target 1"])} | T2 {fmt_price(row["Target 2"])} |
                 {row["Setup Type"]} | Score {row["Momentum Score"]}
@@ -790,12 +965,17 @@ def render_dynamic_sections(
 
     top10 = plans_df.head(10)
     display_cols = [
+        "Runner Label",
         "Ticker",
         "Status",
         "Setup Type",
         "Current Price",
         "Intraday Gain %",
         "Relative Volume",
+        "Near High %",
+        "Volume Acceleration",
+        "Compression %",
+        "Volume Spike",
         "Entry",
         "Stop",
         "Target 1",
