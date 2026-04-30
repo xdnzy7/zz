@@ -23,12 +23,13 @@ import yfinance as yf
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 logging.getLogger("urllib3").setLevel(logging.CRITICAL)
 
-APP_VERSION = "pre-move-momentum-scanner-2026-04-30"
+APP_VERSION = "pre-move-momentum-scanner-automatic-first-2026-04-30"
 YAHOO_SCREENER_URL = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
+YAHOO_TRENDING_URL = "https://query1.finance.yahoo.com/v1/finance/trending/US"
 NASDAQ_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
 OTHER_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
 VALID_TICKER_RE = re.compile(r"^[A-Z]{1,5}$")
-DEFAULT_PRIORITY_TICKERS = "AKAN, RDAC, BIYA, SBLX, ATER"
+DEFAULT_OPTIONAL_WATCHLIST = ""
 
 FALLBACK_TICKERS = [
     "AKAN",
@@ -76,7 +77,7 @@ class ScannerSettings:
     output_limit: int = 100
     request_timeout_seconds: int = 3
     cache_seconds: int = 20
-    priority_tickers: str = DEFAULT_PRIORITY_TICKERS
+    optional_watchlist: str = DEFAULT_OPTIONAL_WATCHLIST
 
 
 @dataclass
@@ -88,6 +89,7 @@ class AppState:
     settings: ScannerSettings = field(default_factory=ScannerSettings)
     candidates_df: pd.DataFrame = field(default_factory=pd.DataFrame)
     watched_df: pd.DataFrame = field(default_factory=pd.DataFrame)
+    source_debug_df: pd.DataFrame = field(default_factory=pd.DataFrame)
     skip_counts: dict[str, int] = field(default_factory=lambda: {key: 0 for key in SKIP_KEYS})
     cycle_count: int = 0
     scanned_count: int = 0
@@ -97,6 +99,7 @@ class AppState:
     last_scan_seconds: float = 0.0
     timed_out: bool = False
     status_text: str = "Starting scanner..."
+    source_message: Optional[str] = None
     error: Optional[str] = None
     download_cache: dict[str, tuple[float, pd.DataFrame]] = field(default_factory=dict)
     universe_cache: tuple[float, list[str]] | None = None
@@ -111,7 +114,7 @@ def is_valid_ticker(ticker: str) -> bool:
     return bool(VALID_TICKER_RE.fullmatch(str(ticker).upper().strip()))
 
 
-def parse_priority_tickers(value: str) -> list[str]:
+def parse_optional_watchlist(value: str) -> list[str]:
     tickers = [part.upper().strip() for part in re.split(r"[\s,;]+", value or "")]
     return [ticker for ticker in dict.fromkeys(tickers) if is_valid_ticker(ticker)]
 
@@ -159,39 +162,75 @@ def safe_request_json(url: str, params: dict[str, object], timeout: int = 4) -> 
     return response.json()
 
 
-def get_active_movers(max_count: int) -> list[str]:
-    global ACTIVE_QUOTE_CACHE
+def add_quote_from_yahoo(symbol: str, quote: dict[str, object]) -> None:
+    ACTIVE_QUOTE_CACHE[symbol] = {
+        "price": quote.get("regularMarketPrice") or quote.get("preMarketPrice") or quote.get("postMarketPrice"),
+        "previous_close": quote.get("regularMarketPreviousClose"),
+        "change_pct": quote.get("regularMarketChangePercent") or quote.get("preMarketChangePercent"),
+        "volume": quote.get("regularMarketVolume") or quote.get("preMarketVolume"),
+    }
+
+
+def get_yahoo_screen_tickers(screen: str, max_count: int) -> list[str]:
+    try:
+        data = safe_request_json(YAHOO_SCREENER_URL, {"scrIds": screen, "count": min(max_count, 250)})
+        quotes = data["finance"]["result"][0]["quotes"]  # type: ignore[index]
+    except Exception:
+        return []
+
     tickers: list[str] = []
-    screens = [
-        "day_gainers",
-        "most_actives",
-        "pre_market_gainers",
-        "pre_market_most_actives",
-        "undervalued_growth_stocks",
-    ]
-
-    for screen in screens:
-        try:
-            data = safe_request_json(YAHOO_SCREENER_URL, {"scrIds": screen, "count": min(max_count, 250)})
-            quotes = data["finance"]["result"][0]["quotes"]  # type: ignore[index]
-        except Exception:
+    for quote in quotes:
+        symbol = str(quote.get("symbol", "")).upper().strip()
+        quote_type = str(quote.get("quoteType", "")).upper()
+        market = str(quote.get("market", "")).lower()
+        if quote_type != "EQUITY" or market not in {"us_market", ""} or not is_valid_ticker(symbol):
             continue
+        tickers.append(symbol)
+        add_quote_from_yahoo(symbol, quote)
+    return list(dict.fromkeys(tickers))
 
-        for quote in quotes:
-            symbol = str(quote.get("symbol", "")).upper().strip()
-            quote_type = str(quote.get("quoteType", "")).upper()
-            market = str(quote.get("market", "")).lower()
-            if quote_type != "EQUITY" or market not in {"us_market", ""} or not is_valid_ticker(symbol):
-                continue
+
+def get_trending_tickers(max_count: int) -> list[str]:
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        response = requests.get(YAHOO_TRENDING_URL, headers=headers, timeout=4)
+        response.raise_for_status()
+        quotes = response.json()["finance"]["result"][0]["quotes"]
+    except Exception:
+        return []
+
+    tickers: list[str] = []
+    for quote in quotes:
+        symbol = str(quote.get("symbol", "")).upper().strip()
+        quote_type = str(quote.get("quoteType", "")).upper()
+        if quote_type in {"EQUITY", ""} and is_valid_ticker(symbol):
             tickers.append(symbol)
-            ACTIVE_QUOTE_CACHE[symbol] = {
-                "price": quote.get("regularMarketPrice") or quote.get("preMarketPrice") or quote.get("postMarketPrice"),
-                "previous_close": quote.get("regularMarketPreviousClose"),
-                "change_pct": quote.get("regularMarketChangePercent") or quote.get("preMarketChangePercent"),
-                "volume": quote.get("regularMarketVolume") or quote.get("preMarketVolume"),
-            }
-
+            add_quote_from_yahoo(symbol, quote)
     return list(dict.fromkeys(tickers))[:max_count]
+
+
+def get_active_movers(max_count: int) -> tuple[list[str], list[dict[str, object]], dict[str, str], bool]:
+    global ACTIVE_QUOTE_CACHE
+    sources = [
+        ("day_gainers", lambda: get_yahoo_screen_tickers("day_gainers", max_count)),
+        ("most_actives", lambda: get_yahoo_screen_tickers("most_actives", max_count)),
+        ("premarket_movers", lambda: get_yahoo_screen_tickers("pre_market_gainers", max_count) + get_yahoo_screen_tickers("pre_market_most_actives", max_count)),
+        ("trending", lambda: get_trending_tickers(max_count)),
+    ]
+    tickers: list[str] = []
+    source_by_ticker: dict[str, str] = {}
+    debug_rows: list[dict[str, object]] = []
+
+    for source_name, fetcher in sources:
+        source_tickers = list(dict.fromkeys(fetcher()))
+        debug_rows.append({"Source": source_name, "Fetched": len(source_tickers), "Scanned": 0, "Passed Filters": 0})
+        for ticker in source_tickers:
+            tickers.append(ticker)
+            source_by_ticker.setdefault(ticker, source_name)
+
+    tickers = list(dict.fromkeys(tickers))[:max_count]
+    unavailable = len(tickers) == 0
+    return tickers, debug_rows, source_by_ticker, unavailable
 
 
 def fetch_security_names(state: AppState) -> dict[str, str]:
@@ -211,12 +250,6 @@ def fetch_security_names(state: AppState) -> dict[str, str]:
         nasdaq = nasdaq.rename(columns={"Symbol": "Ticker", "Security Name": "Name"})
         frames.append(nasdaq[["Ticker", "Name"]])
 
-        other_text = requests.get(OTHER_LISTED_URL, headers=headers, timeout=4).text
-        other = pd.read_csv(StringIO(other_text), sep="|")
-        other = other[other["ACT Symbol"].notna()]
-        other = other[other["ACT Symbol"] != "File Creation Time"]
-        other = other.rename(columns={"ACT Symbol": "Ticker", "Security Name": "Name"})
-        frames.append(other[["Ticker", "Name"]])
     except Exception:
         return SECURITY_NAME_CACHE
 
@@ -230,19 +263,37 @@ def fetch_security_names(state: AppState) -> dict[str, str]:
     return SECURITY_NAME_CACHE
 
 
-def build_scan_universe(state: AppState, settings: ScannerSettings) -> list[str]:
-    priority = parse_priority_tickers(settings.priority_tickers)
-    active = get_active_movers(max(settings.max_tickers, 150))
+def build_scan_universe(state: AppState, settings: ScannerSettings) -> tuple[list[str], list[dict[str, object]], dict[str, str], Optional[str]]:
+    optional_watchlist = parse_optional_watchlist(settings.optional_watchlist)
+    active, debug_rows, source_by_ticker, unavailable = get_active_movers(max(settings.max_tickers, 150))
+    message = None
+
+    if unavailable:
+        message = "Active movers source unavailable"
+        names = fetch_security_names(state)
+        fallback = list(names)[: settings.max_tickers] if names else FALLBACK_TICKERS
+        active = list(dict.fromkeys(fallback))[: settings.max_tickers]
+        source_by_ticker = {ticker: "fallback" for ticker in active}
+        debug_rows.append({"Source": "fallback", "Fetched": len(active), "Scanned": 0, "Passed Filters": 0})
 
     if settings.cloud_fast_mode:
-        return list(dict.fromkeys(priority + active))[: settings.max_tickers]
+        tickers = list(dict.fromkeys(active + optional_watchlist))[: settings.max_tickers]
+    else:
+        names = fetch_security_names(state)
+        all_tickers = list(names) or FALLBACK_TICKERS
+        remaining = [ticker for ticker in all_tickers if ticker not in set(active + optional_watchlist)]
+        explore_size = min(len(remaining), max(0, settings.max_tickers - len(active + optional_watchlist)))
+        explore = random.sample(remaining, explore_size) if explore_size else []
+        tickers = list(dict.fromkeys(active + optional_watchlist + explore))[: settings.max_tickers]
+        for ticker in explore:
+            source_by_ticker.setdefault(ticker, "fallback")
 
-    names = fetch_security_names(state)
-    all_tickers = list(names) or FALLBACK_TICKERS
-    remaining = [ticker for ticker in all_tickers if ticker not in set(priority + active)]
-    explore_size = min(len(remaining), max(0, settings.max_tickers - len(priority + active)))
-    explore = random.sample(remaining, explore_size) if explore_size else []
-    return list(dict.fromkeys(priority + active + explore))[: settings.max_tickers]
+    if optional_watchlist:
+        debug_rows.append({"Source": "optional_watchlist", "Fetched": len(optional_watchlist), "Scanned": 0, "Passed Filters": 0})
+        for ticker in optional_watchlist:
+            source_by_ticker.setdefault(ticker, "optional_watchlist")
+
+    return tickers, debug_rows, source_by_ticker, message
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -598,41 +649,65 @@ def rank_watched(rows: list[dict[str, object]]) -> pd.DataFrame:
     return df.sort_values(sort_cols, ascending=[False] * len(sort_cols)).head(150) if sort_cols else df.head(150)
 
 
+def update_source_debug(
+    source_debug_rows: list[dict[str, object]],
+    scanned_by_source: dict[str, int],
+    passed_by_source: dict[str, int],
+) -> list[dict[str, object]]:
+    rows = [dict(row) for row in source_debug_rows]
+    known_sources = {str(row.get("Source")) for row in rows}
+    for source in set(scanned_by_source) | set(passed_by_source):
+        if source not in known_sources:
+            rows.append({"Source": source, "Fetched": 0, "Scanned": 0, "Passed Filters": 0})
+    for row in rows:
+        source = str(row.get("Source"))
+        row["Scanned"] = int(scanned_by_source.get(source, 0))
+        row["Passed Filters"] = int(passed_by_source.get(source, 0))
+    return rows
+
+
 def publish(
     state: AppState,
     candidate_rows: list[dict[str, object]],
     watched_rows: list[dict[str, object]],
     skip_counts: dict[str, int],
+    source_debug_rows: list[dict[str, object]],
     scanned: int,
     started: float,
     status_text: str,
     timed_out: bool = False,
+    source_message: Optional[str] = None,
 ) -> None:
     candidates = rank_candidates(candidate_rows).head(state.settings.output_limit)
     watched = rank_watched(watched_rows)
     with state.lock:
         state.candidates_df = candidates
         state.watched_df = watched
+        state.source_debug_df = pd.DataFrame(source_debug_rows)
         state.skip_counts = dict(skip_counts)
         state.scanned_count = scanned
         state.candidate_count = len(candidates)
         state.last_scan_seconds = time.monotonic() - started
         state.timed_out = timed_out
         state.status_text = status_text
+        state.source_message = source_message
 
 
 def scan_once(state: AppState, settings: ScannerSettings) -> None:
     started = time.monotonic()
     deadline = started + settings.scan_timeout_seconds
-    tickers = build_scan_universe(state, settings)
+    tickers, source_debug_rows, source_by_ticker, source_message = build_scan_universe(state, settings)
     candidate_rows: list[dict[str, object]] = []
     watched_rows: list[dict[str, object]] = []
     skip_counts = {key: 0 for key in SKIP_KEYS}
+    scanned_by_source: dict[str, int] = {}
+    passed_by_source: dict[str, int] = {}
     scanned = 0
 
     with state.lock:
         state.last_scan_started = datetime.now().isoformat(timespec="seconds")
         state.status_text = f"Scanning {len(tickers)} active symbols..."
+        state.source_message = source_message
         state.error = None
         state.timed_out = False
 
@@ -649,18 +724,24 @@ def scan_once(state: AppState, settings: ScannerSettings) -> None:
             for future in done:
                 ticker = pending.pop(future, "")
                 scanned += 1
+                source_name = source_by_ticker.get(ticker, "fallback")
+                scanned_by_source[source_name] = scanned_by_source.get(source_name, 0) + 1
                 try:
                     candidate, watched, skip_reason = future.result(timeout=0)
                 except Exception:
                     candidate, watched, skip_reason = None, None, "missing_data"
                 if watched is not None:
+                    watched["Source"] = source_name
                     watched_rows.append(watched)
                 if candidate is not None:
+                    candidate["Source"] = source_name
                     candidate_rows.append(candidate)
+                    passed_by_source[source_name] = passed_by_source.get(source_name, 0) + 1
                 elif skip_reason in skip_counts:
                     skip_counts[skip_reason] += 1
                 status = f"Scanning active movers: {scanned}/{len(tickers)} complete"
-                publish(state, candidate_rows, watched_rows, skip_counts, scanned, started, status)
+                current_debug = update_source_debug(source_debug_rows, scanned_by_source, passed_by_source)
+                publish(state, candidate_rows, watched_rows, skip_counts, current_debug, scanned, started, status, source_message=source_message)
             pending = {future: pending[future] for future in pending_set}
 
         timed_out = bool(pending)
@@ -670,7 +751,8 @@ def scan_once(state: AppState, settings: ScannerSettings) -> None:
         executor.shutdown(wait=False, cancel_futures=True)
 
     status_text = "Scan timeout reached; showing partial results." if timed_out else "Scan complete."
-    publish(state, candidate_rows, watched_rows, skip_counts, scanned, started, status_text, timed_out)
+    final_debug = update_source_debug(source_debug_rows, scanned_by_source, passed_by_source)
+    publish(state, candidate_rows, watched_rows, skip_counts, final_debug, scanned, started, status_text, timed_out, source_message)
     with state.lock:
         state.last_scan_finished = datetime.now().isoformat(timespec="seconds")
         state.cycle_count += 1
@@ -705,12 +787,14 @@ def restart_scanner(state: AppState, settings: ScannerSettings, clear_cache: boo
         state.settings = settings
         state.candidates_df = pd.DataFrame()
         state.watched_df = pd.DataFrame()
+        state.source_debug_df = pd.DataFrame()
         state.skip_counts = {key: 0 for key in SKIP_KEYS}
         state.scanned_count = 0
         state.candidate_count = 0
         state.last_scan_seconds = 0.0
         state.timed_out = False
         state.error = None
+        state.source_message = None
         state.status_text = "Restarting scanner..."
         if clear_cache:
             state.download_cache = {}
@@ -737,6 +821,7 @@ def snapshot(state: AppState) -> dict[str, object]:
             "settings": state.settings,
             "candidates": state.candidates_df.copy(),
             "watched": state.watched_df.copy(),
+            "source_debug": state.source_debug_df.copy(),
             "skip_counts": dict(state.skip_counts),
             "cycle": state.cycle_count,
             "scanned": state.scanned_count,
@@ -746,6 +831,7 @@ def snapshot(state: AppState) -> dict[str, object]:
             "last_scan_finished": state.last_scan_finished,
             "timed_out": state.timed_out,
             "status_text": state.status_text,
+            "source_message": state.source_message,
             "error": state.error,
             "thread_alive": bool(state.scanner_thread and state.scanner_thread.is_alive()),
         }
@@ -803,6 +889,7 @@ def render_priority_card(row: pd.Series) -> None:
 def render_dashboard(snap: dict[str, object]) -> None:
     candidates: pd.DataFrame = snap["candidates"]  # type: ignore[assignment]
     watched: pd.DataFrame = snap["watched"]  # type: ignore[assignment]
+    source_debug: pd.DataFrame = snap["source_debug"]  # type: ignore[assignment]
     skip_counts: dict[str, int] = snap["skip_counts"]  # type: ignore[assignment]
 
     metrics = st.columns(5)
@@ -818,6 +905,8 @@ def render_dashboard(snap: dict[str, object]) -> None:
     )
     if snap["timed_out"]:
         st.warning("20 second scan timeout reached. Partial results are displayed.")
+    if snap["source_message"]:
+        st.warning(str(snap["source_message"]))
     if snap["error"]:
         st.error(str(snap["error"]))
 
@@ -879,6 +968,8 @@ def render_dashboard(snap: dict[str, object]) -> None:
         st.warning(f"No symbols returned usable data yet. Largest skip bucket: {top_skip} ({skip_counts.get(top_skip, 0):,}).")
 
     with st.expander("Watched movers and scanner diagnostics", expanded=False):
+        if not source_debug.empty:
+            st.dataframe(source_debug, use_container_width=True, hide_index=True)
         if not watched.empty:
             st.dataframe(watched, use_container_width=True, hide_index=True)
         st.dataframe(
@@ -897,7 +988,7 @@ def main() -> None:
     settings: ScannerSettings = snap["settings"]  # type: ignore[assignment]
 
     st.title("Pre-Move Momentum Scanner")
-    st.caption("Speed-first active mover scanner for pressure before breakout, not late chase entries.")
+    st.caption("Scanner discovers tickers automatically. Optional watchlist is only used to force-check names.")
 
     with st.sidebar:
         st.header("Scanner Controls")
@@ -906,7 +997,6 @@ def main() -> None:
         if local_full_mode:
             cloud_fast_mode = False
 
-        priority_tickers = st.text_area("Priority tickers", value=settings.priority_tickers, height=80)
         max_tickers_max = 150 if cloud_fast_mode else 1000
         max_tickers = st.slider("Max tickers", 50, max_tickers_max, min(settings.max_tickers, max_tickers_max), step=10)
         workers = st.slider("Workers", 1, 12, min(settings.max_workers, 12), step=1)
@@ -915,6 +1005,9 @@ def main() -> None:
         min_volume = st.number_input("Minimum volume", min_value=0, value=settings.min_volume, step=25_000)
         max_price = st.slider("Maximum price", 1.0, 200.0, float(settings.max_price), step=1.0)
         min_rvol = st.slider("Minimum RVOL pressure", 0.0, 3.0, float(settings.min_relative_volume), step=0.1)
+        with st.expander("Advanced", expanded=False):
+            optional_watchlist = st.text_area("Optional advanced watchlist", value=settings.optional_watchlist, height=80)
+            st.caption("Use this only to force-check names. The scanner discovers tickers automatically.")
 
         new_settings = ScannerSettings(
             cloud_fast_mode=cloud_fast_mode,
@@ -925,7 +1018,7 @@ def main() -> None:
             max_price=float(max_price),
             min_volume=int(min_volume),
             min_relative_volume=float(min_rvol),
-            priority_tickers=priority_tickers,
+            optional_watchlist=optional_watchlist,
         )
 
         if st.button("Run scan now", type="primary", use_container_width=True):
