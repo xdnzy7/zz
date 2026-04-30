@@ -23,7 +23,7 @@ import yfinance as yf
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 logging.getLogger("urllib3").setLevel(logging.CRITICAL)
 
-APP_VERSION = "pre-move-momentum-scanner-automatic-first-2026-04-30"
+APP_VERSION = "pre-move-momentum-scanner-polished-ui-2026-04-30"
 YAHOO_SCREENER_URL = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
 YAHOO_TRENDING_URL = "https://query1.finance.yahoo.com/v1/finance/trending/US"
 NASDAQ_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
@@ -136,6 +136,26 @@ def fmt_price(value: object) -> str:
 
 def fmt_num(value: object) -> str:
     return f"{int(safe_float(value, 0)):,}"
+
+
+def fmt_currency(value: object) -> str:
+    value = safe_float(value, np.nan)
+    return "N/A" if np.isnan(value) else f"${value:.2f}"
+
+
+def fmt_pct(value: object) -> str:
+    value = safe_float(value, np.nan)
+    return "N/A" if np.isnan(value) else f"{value:.2f}%"
+
+
+def fmt_rvol(value: object) -> str:
+    value = safe_float(value, np.nan)
+    return "N/A" if np.isnan(value) else f"{value:.2f}"
+
+
+def fmt_score(value: object) -> str:
+    value = safe_float(value, 0)
+    return f"{value:.0f}/100"
 
 
 def round_cent(value: float) -> float:
@@ -841,23 +861,112 @@ def apply_theme() -> None:
     st.markdown(
         """
         <style>
-            .stApp { background: #070b12; color: #e5e7eb; }
-            [data-testid="stSidebar"] { background: #0b1220; border-right: 1px solid #1f2937; }
-            .block-container { padding-top: 1.2rem; max-width: 1440px; }
-            h1, h2, h3 { color: #f8fafc; letter-spacing: 0; }
+            :root {
+                --panel: #0d1422;
+                --panel-2: #111a2b;
+                --line: #223047;
+                --muted: #94a3b8;
+                --text: #e5e7eb;
+                --green: #22c55e;
+                --orange: #f59e0b;
+                --red: #ef4444;
+            }
+            .stApp {
+                background:
+                    radial-gradient(circle at 20% 0%, rgba(34, 197, 94, 0.08), transparent 28rem),
+                    linear-gradient(180deg, #060a11 0%, #0a101b 100%);
+                color: var(--text);
+            }
+            [data-testid="stSidebar"] {
+                background: #09111f;
+                border-right: 1px solid #1f2937;
+            }
+            .block-container {
+                padding-top: 1.25rem;
+                padding-bottom: 2rem;
+                max-width: 1680px;
+            }
+            h1, h2, h3 {
+                color: #f8fafc;
+                letter-spacing: 0;
+            }
+            h1 { font-size: clamp(1.7rem, 3vw, 2.6rem); }
             div[data-testid="stMetric"] {
-                background: linear-gradient(180deg, #111827 0%, #0b1220 100%);
-                border: 1px solid #243244;
-                border-radius: 8px;
-                padding: 0.75rem;
+                background: linear-gradient(180deg, var(--panel-2) 0%, var(--panel) 100%);
+                border: 1px solid var(--line);
+                border-radius: 16px;
+                padding: 1rem;
+                box-shadow: 0 14px 34px rgba(0, 0, 0, 0.24);
+                min-height: 96px;
             }
             div[data-testid="stDataFrame"] {
-                border: 1px solid #1f2937;
-                border-radius: 8px;
+                border: 1px solid var(--line);
+                border-radius: 16px;
+                overflow: hidden;
+                box-shadow: 0 12px 30px rgba(0, 0, 0, 0.22);
             }
             .stButton button {
-                border-radius: 8px;
+                border-radius: 16px;
                 border: 1px solid #334155;
+            }
+            div[data-testid="stVerticalBlockBorderWrapper"] {
+                border-radius: 16px;
+                border-color: var(--line);
+                background: linear-gradient(180deg, rgba(17, 26, 43, 0.96), rgba(11, 18, 32, 0.96));
+                box-shadow: 0 18px 42px rgba(0, 0, 0, 0.25);
+            }
+            .pm-card-title {
+                font-size: clamp(1.6rem, 4vw, 2.2rem);
+                line-height: 1;
+                font-weight: 800;
+                color: #f8fafc;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            .pm-card-subtle {
+                color: var(--muted);
+                font-size: 0.86rem;
+                margin-top: -0.25rem;
+            }
+            .pm-chip-row {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 0.4rem;
+                margin-top: 0.45rem;
+            }
+            .pm-chip {
+                display: inline-flex;
+                align-items: center;
+                border: 1px solid #334155;
+                border-radius: 999px;
+                padding: 0.2rem 0.55rem;
+                color: #dbeafe;
+                background: rgba(30, 41, 59, 0.7);
+                font-size: 0.78rem;
+                white-space: nowrap;
+            }
+            .pm-mobile-cards { display: none; }
+            [data-testid="stDataFrame"] div,
+            [data-testid="stDataFrame"] span {
+                white-space: nowrap;
+            }
+            @media (max-width: 760px) {
+                .block-container {
+                    padding-left: 0.9rem;
+                    padding-right: 0.9rem;
+                }
+                div[data-testid="stMetric"] {
+                    min-height: 82px;
+                    padding: 0.8rem;
+                }
+                .pm-desktop-table,
+                div[data-testid="stDataFrame"] {
+                    display: none;
+                }
+                .pm-mobile-cards {
+                    display: block;
+                }
             }
         </style>
         """,
@@ -867,23 +976,65 @@ def apply_theme() -> None:
 
 def render_priority_card(row: pd.Series) -> None:
     with st.container(border=True):
-        head = st.columns([0.26, 0.34, 0.4])
-        head[0].markdown(f"**{row.get('Ticker', 'N/A')}**")
-        head[1].markdown(status_badge(str(row.get("Status", "WAIT FOR TRIGGER"))))
-        head[2].caption(str(row.get("Setup Type", "PRE-MOVE WATCH")))
+        ticker = str(row.get("Ticker", "N/A"))
+        status = str(row.get("Status", "WAIT FOR TRIGGER"))
+        score = safe_float(row.get("Pre-Move Score"), 0)
+        reason_text = str(row.get("Why This May Run", ""))
+        chips = []
+        for label, needle in [
+            ("near high", "near day high"),
+            ("gap up", "gap up"),
+            ("volume spike", "volume ignition"),
+            ("VWAP reclaim", "VWAP reclaim"),
+            ("higher lows", "higher lows"),
+        ]:
+            if needle.lower() in reason_text.lower():
+                chips.append(label)
+        chips = chips[:3] or ["watching pressure"]
 
-        metrics = st.columns(4)
-        metrics[0].metric("Price", f"${fmt_price(row.get('Current Price'))}")
-        metrics[1].metric("Score", f"{safe_float(row.get('Pre-Move Score'), 0):.1f}")
-        metrics[2].metric("RVOL", f"{safe_float(row.get('RVOL'), 0):.2f}x")
-        metrics[3].metric("Near High", f"{safe_float(row.get('Near High %'), 0):.2f}%")
+        head = st.columns([0.52, 0.48])
+        head[0].markdown(f"<div class='pm-card-title'>{ticker}</div>", unsafe_allow_html=True)
+        head[1].markdown(status_badge(status))
+        st.caption(str(row.get("Setup Type", "PRE-MOVE WATCH")))
 
-        trade = st.columns(4)
-        trade[0].caption(f"Entry {fmt_price(row.get('Trigger Entry'))}")
-        trade[1].caption(f"Stop {fmt_price(row.get('Stop'))}")
-        trade[2].caption(f"T1 {fmt_price(row.get('Target 1'))}")
-        trade[3].caption(str(row.get("Risk/Reward", "N/A")))
-        st.caption(str(row.get("Why This May Run", "")))
+        st.progress(min(max(score / 100, 0), 1), text=f"Pre-Move Score {fmt_score(score)}")
+
+        grid_top = st.columns(2)
+        grid_top[0].metric("Price", fmt_currency(row.get("Current Price")))
+        grid_top[1].metric("Trigger", fmt_currency(row.get("Trigger Entry")))
+        grid_bottom = st.columns(2)
+        grid_bottom[0].metric("Stop", fmt_currency(row.get("Stop")))
+        grid_bottom[1].metric("Target", fmt_currency(row.get("Target 1")))
+
+        chip_html = "".join(f"<span class='pm-chip'>{chip}</span>" for chip in chips)
+        st.markdown(f"<div class='pm-chip-row'>{chip_html}</div>", unsafe_allow_html=True)
+        st.caption(reason_text)
+
+
+def compact_reason(value: object) -> str:
+    text = str(value or "")
+    parts = [part.strip() for part in text.split(",") if part.strip()]
+    return ", ".join(parts[:3]) if parts else "pressure building"
+
+
+def make_compact_table(candidates: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    for _, row in candidates.iterrows():
+        rows.append(
+            {
+                "Ticker": str(row.get("Ticker", "")),
+                "Status": str(row.get("Status", "")),
+                "Score": fmt_score(row.get("Pre-Move Score")),
+                "Price": fmt_currency(row.get("Current Price")),
+                "Trigger": fmt_currency(row.get("Trigger Entry")),
+                "Stop": fmt_currency(row.get("Stop")),
+                "Target 1": fmt_currency(row.get("Target 1")),
+                "RVOL": fmt_rvol(row.get("RVOL")),
+                "Gap %": fmt_pct(row.get("Gap %")),
+                "Reason": compact_reason(row.get("Why This May Run")),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def render_dashboard(snap: dict[str, object]) -> None:
@@ -911,56 +1062,54 @@ def render_dashboard(snap: dict[str, object]) -> None:
         st.error(str(snap["error"]))
 
     st.subheader("High Priority Pre-Move")
-    top5 = candidates.head(5)
-    if top5.empty:
+    top_priority = candidates.head(3)
+    if top_priority.empty:
         st.info("No filtered pre-move candidates yet. Showing watched movers below.")
     else:
-        cols = st.columns(min(5, len(top5)))
-        for index, (_, row) in enumerate(top5.iterrows()):
+        cols = st.columns(min(3, len(top_priority)), gap="large")
+        for index, (_, row) in enumerate(top_priority.iterrows()):
             with cols[index % len(cols)]:
                 render_priority_card(row)
 
     st.subheader("Pre-Move Scanner Table")
-    display_cols = [
-        "Ticker",
-        "Current Price",
-        "Pre-Move Score",
-        "Status",
-        "Setup Type",
-        "Trigger Entry",
-        "Stop",
-        "Target 1",
-        "Target 2",
-        "Risk/Reward",
-        "RVOL",
-        "Volume Accel",
-        "Near High %",
-        "Gap %",
-        "Confirmation",
-        "Invalidation",
-        "Why This May Run",
-        "Avoid Reason",
-    ]
-
     if not candidates.empty:
-        table = candidates[[col for col in display_cols if col in candidates.columns]].copy()
+        table = make_compact_table(candidates)
+        st.markdown("<div class='pm-desktop-table'>", unsafe_allow_html=True)
         st.dataframe(
             table,
             use_container_width=True,
             hide_index=True,
             column_config={
-                "Pre-Move Score": st.column_config.ProgressColumn("Pre-Move Score", min_value=0, max_value=100),
-                "Current Price": st.column_config.NumberColumn("Current Price", format="$%.2f"),
-                "Trigger Entry": st.column_config.NumberColumn("Trigger Entry", format="$%.2f"),
-                "Stop": st.column_config.NumberColumn("Stop", format="$%.2f"),
-                "Target 1": st.column_config.NumberColumn("Target 1", format="$%.2f"),
-                "Target 2": st.column_config.NumberColumn("Target 2", format="$%.2f"),
-                "RVOL": st.column_config.NumberColumn("RVOL", format="%.2fx"),
-                "Volume Accel": st.column_config.NumberColumn("Volume Accel", format="%.2fx"),
-                "Near High %": st.column_config.NumberColumn("Near High %", format="%.2f%%"),
-                "Gap %": st.column_config.NumberColumn("Gap %", format="%.2f%%"),
+                "Ticker": st.column_config.TextColumn("Ticker", width="small"),
+                "Status": st.column_config.TextColumn("Status", width="medium"),
+                "Score": st.column_config.TextColumn("Score", width="small"),
+                "Price": st.column_config.TextColumn("Price", width="small"),
+                "Trigger": st.column_config.TextColumn("Trigger", width="small"),
+                "Stop": st.column_config.TextColumn("Stop", width="small"),
+                "Target 1": st.column_config.TextColumn("Target 1", width="small"),
+                "RVOL": st.column_config.TextColumn("RVOL", width="small"),
+                "Gap %": st.column_config.TextColumn("Gap %", width="small"),
+                "Reason": st.column_config.TextColumn("Reason", width="large"),
             },
         )
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        with st.expander("Extra trade-plan details", expanded=False):
+            detail_cols = [
+                "Ticker",
+                "Setup Type",
+                "Target 2",
+                "Risk/Reward",
+                "Volume Accel",
+                "Near High %",
+                "Confirmation",
+                "Invalidation",
+                "Why This May Run",
+                "Avoid Reason",
+            ]
+            details = candidates[[col for col in detail_cols if col in candidates.columns]].copy()
+            if not details.empty:
+                st.dataframe(details, use_container_width=True, hide_index=True)
     elif not watched.empty:
         st.dataframe(watched, use_container_width=True, hide_index=True)
     else:
