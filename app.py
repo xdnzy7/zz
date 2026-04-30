@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import html
 import math
 import re
 import time
@@ -113,6 +114,7 @@ TEXT = {
         "status": "Trade status",
         "mode": "Scanner mode",
         "source": "Source",
+        "score": "Pre-Move Score",
         "footer": "Not financial advice. The app does not predict outcomes; it filters conditions and forces risk checks.",
     },
     "Arabic": {
@@ -160,6 +162,7 @@ TEXT = {
         "status": "حالة الخطة",
         "mode": "وضع الماسح",
         "source": "المصدر",
+        "score": "درجة ما قبل الحركة",
         "footer": "ليست نصيحة مالية. التطبيق لا يتنبأ؛ بل يرشح الشروط ويفرض فحص المخاطرة.",
     },
 }
@@ -751,7 +754,7 @@ def scan_universe(tickers: list[str], config: ScanConfig, progress=None) -> pd.D
     return frame.reset_index(drop=True)
 
 
-def inject_theme(lang: str) -> None:
+def apply_theme(lang: str) -> None:
     direction = "rtl" if is_arabic(lang) else "ltr"
     align = "right" if is_arabic(lang) else "left"
     st.markdown(
@@ -802,13 +805,244 @@ def inject_theme(lang: str) -> None:
             border-radius: 8px;
             overflow: hidden;
         }}
+        .live-metric-grid {{
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: .75rem;
+            direction: {direction};
+            margin: .75rem 0 1rem;
+        }}
+        .live-metric-card {{
+            position: relative;
+            min-height: 112px;
+            border-radius: 16px;
+            border: 1px solid rgba(255, 255, 255, .11);
+            background:
+                linear-gradient(180deg, rgba(255, 255, 255, .075), rgba(255, 255, 255, .035)),
+                rgba(7, 15, 17, .92);
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, .06), 0 16px 34px rgba(0, 0, 0, .24);
+            padding: .85rem .95rem;
+            overflow: hidden;
+            text-align: {align};
+            transition: border-color .28s ease, box-shadow .28s ease, transform .28s ease;
+        }}
+        .live-metric-card::after {{
+            content: "";
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+            opacity: 0;
+            transition: opacity .35s ease;
+        }}
+        .live-metric-card.up {{
+            border-color: rgba(45, 212, 128, .72);
+            animation: pulseGreen 900ms ease-out 1, glowGreen 1200ms ease-out 1;
+        }}
+        .live-metric-card.down {{
+            border-color: rgba(248, 113, 113, .72);
+            animation: pulseRed 900ms ease-out 1, glowRed 1200ms ease-out 1;
+        }}
+        .live-metric-card.up::after {{
+            background: linear-gradient(90deg, rgba(34, 197, 94, .18), transparent 70%);
+            opacity: 1;
+            animation: fadeFlash 900ms ease-out 1 forwards;
+        }}
+        .live-metric-card.down::after {{
+            background: linear-gradient(90deg, rgba(239, 68, 68, .18), transparent 70%);
+            opacity: 1;
+            animation: fadeFlash 900ms ease-out 1 forwards;
+        }}
+        .live-metric-label {{
+            color: #aebbb5;
+            font-size: .78rem;
+            line-height: 1.2;
+            margin-bottom: .45rem;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }}
+        .live-metric-value {{
+            color: #f5fff9;
+            font-size: clamp(1.35rem, 2.4vw, 2.05rem);
+            font-weight: 800;
+            letter-spacing: 0;
+            line-height: 1.05;
+            font-variant-numeric: tabular-nums;
+            transition: color .25s ease, transform .25s ease;
+        }}
+        .live-metric-card.up .live-metric-value {{
+            color: #86efac;
+            transform: translateY(-1px);
+        }}
+        .live-metric-card.down .live-metric-value {{
+            color: #fca5a5;
+            transform: translateY(1px);
+        }}
+        .live-metric-delta {{
+            display: inline-flex;
+            align-items: center;
+            gap: .25rem;
+            margin-top: .55rem;
+            min-height: 1.35rem;
+            border-radius: 999px;
+            padding: .18rem .5rem;
+            font-size: .78rem;
+            font-weight: 700;
+            font-variant-numeric: tabular-nums;
+            border: 1px solid rgba(255, 255, 255, .10);
+            color: #9aa8a2;
+            background: rgba(255, 255, 255, .045);
+        }}
+        .live-metric-delta.up {{
+            color: #86efac;
+            background: rgba(34, 197, 94, .12);
+            border-color: rgba(34, 197, 94, .28);
+        }}
+        .live-metric-delta.down {{
+            color: #fca5a5;
+            background: rgba(239, 68, 68, .12);
+            border-color: rgba(239, 68, 68, .28);
+        }}
+        .live-metric-delta.flat {{
+            color: #9aa8a2;
+        }}
+        @keyframes pulseGreen {{
+            0% {{ background-color: rgba(34, 197, 94, .24); }}
+            100% {{ background-color: rgba(7, 15, 17, .92); }}
+        }}
+        @keyframes pulseRed {{
+            0% {{ background-color: rgba(239, 68, 68, .24); }}
+            100% {{ background-color: rgba(7, 15, 17, .92); }}
+        }}
+        @keyframes glowGreen {{
+            0% {{ box-shadow: 0 0 0 rgba(255,255,255,0), 0 16px 34px rgba(0,0,0,.24); }}
+            35% {{ box-shadow: 0 0 28px rgba(45, 212, 128, .18), 0 18px 42px rgba(0,0,0,.30); }}
+            100% {{ box-shadow: inset 0 1px 0 rgba(255,255,255,.06), 0 16px 34px rgba(0,0,0,.24); }}
+        }}
+        @keyframes glowRed {{
+            0% {{ box-shadow: 0 0 0 rgba(255,255,255,0), 0 16px 34px rgba(0,0,0,.24); }}
+            35% {{ box-shadow: 0 0 28px rgba(248, 113, 113, .20), 0 18px 42px rgba(0,0,0,.30); }}
+            100% {{ box-shadow: inset 0 1px 0 rgba(255,255,255,.06), 0 16px 34px rgba(0,0,0,.24); }}
+        }}
+        @keyframes fadeFlash {{
+            0% {{ opacity: 1; }}
+            100% {{ opacity: 0; }}
+        }}
+        @media (max-width: 980px) {{
+            .live-metric-grid {{
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }}
+        }}
+        @media (max-width: 560px) {{
+            .live-metric-grid {{
+                grid-template-columns: 1fr;
+            }}
+            .live-metric-card {{
+                min-height: 96px;
+            }}
+        }}
         </style>
         """,
         unsafe_allow_html=True,
     )
 
 
-def render_plan_card(row: pd.Series, lang: str) -> None:
+def inject_theme(lang: str) -> None:
+    apply_theme(lang)
+
+
+def format_live_value(value: Any) -> str:
+    number = safe_float(value, np.nan)
+    if np.isnan(number):
+        return "N/A"
+    if abs(number) >= 1000:
+        return f"{number:,.0f}"
+    if abs(number) < 1:
+        return f"{number:.4f}"
+    return f"{number:,.2f}"
+
+
+def begin_live_metric_cycle() -> None:
+    if "live_metric_previous_values" not in st.session_state:
+        st.session_state.live_metric_previous_values = {}
+    st.session_state.live_metric_pending_values = {}
+
+
+def commit_live_metric_cycle() -> None:
+    pending = st.session_state.get("live_metric_pending_values", {})
+    previous = st.session_state.get("live_metric_previous_values", {})
+    st.session_state.live_metric_previous_values = {**previous, **pending}
+
+
+def get_metric_direction(key: str, current_value: Any) -> tuple[str, float]:
+    current = safe_float(current_value, np.nan)
+    pending = st.session_state.setdefault("live_metric_pending_values", {})
+    previous_values = st.session_state.setdefault("live_metric_previous_values", {})
+    pending[key] = current
+
+    previous = safe_float(previous_values.get(key), np.nan)
+    if np.isnan(current) or np.isnan(previous):
+        return "flat", 0.0
+
+    tolerance = max(abs(previous), 1.0) * 0.00001
+    delta = current - previous
+    if delta > tolerance:
+        return "up", delta
+    if delta < -tolerance:
+        return "down", delta
+    return "flat", 0.0
+
+
+def render_live_metric_card(
+    label: str,
+    value: Any,
+    key: str,
+    prefix: str = "",
+    suffix: str = "",
+) -> None:
+    direction, delta = get_metric_direction(key, value)
+    arrow = {"up": "▲", "down": "▼", "flat": ""}[direction]
+    lang = st.session_state.get("language", "English")
+    delta_text = ("بدون تغيير" if is_arabic(lang) else "No change") if direction == "flat" else f"{arrow} {delta:+.2f}"
+    formatted = format_live_value(value)
+    value_text = value if isinstance(value, str) else ("N/A" if formatted == "N/A" else f"{prefix}{formatted}{suffix}")
+    st.markdown(
+        f"""
+        <div class="live-metric-card {direction}">
+            <div class="live-metric-label">{html.escape(label)}</div>
+            <div class="live-metric-value">{html.escape(value_text)}</div>
+            <div class="live-metric-delta {direction}">{html.escape(delta_text)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_live_metric_grid(metrics: list[dict[str, Any]]) -> None:
+    cards = []
+    lang = st.session_state.get("language", "English")
+    for metric in metrics:
+        direction, delta = get_metric_direction(metric["key"], metric["value"])
+        arrow = {"up": "▲", "down": "▼", "flat": ""}[direction]
+        delta_text = ("بدون تغيير" if is_arabic(lang) else "No change") if direction == "flat" else f"{arrow} {delta:+.2f}"
+        raw_value = metric["value"]
+        formatted = format_live_value(raw_value)
+        value_text = str(raw_value) if isinstance(raw_value, str) else (
+            "N/A" if formatted == "N/A" else f"{metric.get('prefix', '')}{formatted}{metric.get('suffix', '')}"
+        )
+        cards.append(
+            f"""
+            <div class="live-metric-card {direction}">
+                <div class="live-metric-label">{html.escape(str(metric["label"]))}</div>
+                <div class="live-metric-value">{html.escape(value_text)}</div>
+                <div class="live-metric-delta {direction}">{html.escape(delta_text)}</div>
+            </div>
+            """
+        )
+    st.markdown(f"<div class=\"live-metric-grid\">{''.join(cards)}</div>", unsafe_allow_html=True)
+
+
+def render_trade_card(row: pd.Series, lang: str) -> None:
     comments = plan_comments(row, lang)
     setup = setup_text(str(row["setup"]), lang)
     status_color = "green" if bool(row.get("valid_trade", False)) else "orange"
@@ -823,11 +1057,59 @@ def render_plan_card(row: pd.Series, lang: str) -> None:
         with top_right:
             st.markdown(f":{status_color}[{row['trade_status']}]")
 
-        metric_cols = st.columns(4)
-        metric_cols[0].metric(tr("current", lang), fmt_money(row["current"]), fmt_pct(row["gain_pct"]))
-        metric_cols[1].metric(tr("break", lang), fmt_money(row["breakout_level"]), tr("near_high", lang) + " " + fmt_pct(row["near_high_pct"]))
-        metric_cols[2].metric(tr("stop", lang), fmt_money(row["stop"]), tr("rr", lang) + " " + fmt_rr(row["rr"]))
-        metric_cols[3].metric(tr("rvol", lang), fmt_x(row["rvol"]), tr("vol_acc", lang) + " " + fmt_x(row["vol_accel"]))
+        ticker_key = str(row["ticker"])
+        render_live_metric_grid(
+            [
+                {
+                    "label": tr("current", lang),
+                    "value": row["current"],
+                    "key": f"{ticker_key}:current",
+                    "prefix": "$",
+                },
+                {
+                    "label": tr("break", lang),
+                    "value": row["breakout_level"],
+                    "key": f"{ticker_key}:breakout_level",
+                    "prefix": "$",
+                },
+                {
+                    "label": tr("stop", lang),
+                    "value": row["stop"],
+                    "key": f"{ticker_key}:stop",
+                    "prefix": "$",
+                },
+                {
+                    "label": tr("rvol", lang),
+                    "value": row["rvol"],
+                    "key": f"{ticker_key}:rvol",
+                    "suffix": "x",
+                },
+                {
+                    "label": tr("vol_acc", lang),
+                    "value": row["vol_accel"],
+                    "key": f"{ticker_key}:vol_accel",
+                    "suffix": "x",
+                },
+                {
+                    "label": tr("target1", lang),
+                    "value": row["target_1"],
+                    "key": f"{ticker_key}:target_1",
+                    "prefix": "$",
+                },
+                {
+                    "label": tr("target2", lang),
+                    "value": row["target_2"],
+                    "key": f"{ticker_key}:target_2",
+                    "prefix": "$",
+                },
+                {
+                    "label": tr("score", lang),
+                    "value": row["score"],
+                    "key": f"{ticker_key}:score",
+                    "suffix": "/100",
+                },
+            ]
+        )
 
         info = {
             tr("ticker", lang): row["ticker"],
@@ -869,6 +1151,10 @@ def render_plan_card(row: pd.Series, lang: str) -> None:
                 ]
             )
             st.dataframe(detail, use_container_width=True, hide_index=True)
+
+
+def render_plan_card(row: pd.Series, lang: str) -> None:
+    render_trade_card(row, lang)
 
 
 def mode_key(mode: str) -> str:
@@ -930,6 +1216,8 @@ def initialize_state() -> None:
         "source_counts": {},
         "discovery_message": "",
         "optional_watchlist": "",
+        "live_metric_previous_values": {},
+        "live_metric_pending_values": {},
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -960,7 +1248,7 @@ def main() -> None:
 
     with st.sidebar:
         lang = st.radio("Language / اللغة", ["English", "Arabic"], horizontal=True, key="language")
-        inject_theme(lang)
+        apply_theme(lang)
         st.caption(APP_VERSION)
         st.divider()
         st.subheader(tr("scanner_controls", lang))
@@ -978,7 +1266,7 @@ def main() -> None:
         scan_clicked = st.button(tr("refresh", lang), use_container_width=True)
         st.caption(f"{tr('next_refresh', lang)}: {config.scan_interval}s")
 
-    inject_theme(lang)
+    apply_theme(lang)
 
     st.title(tr("page_title", lang))
     st.caption(tr("subtitle", lang))
@@ -1003,6 +1291,7 @@ def main() -> None:
         st.write(st.session_state.discovery_message)
         st.dataframe(sources, use_container_width=True, hide_index=True)
 
+    begin_live_metric_cycle()
     if frame.empty:
         st.warning(tr("no_results", lang))
     else:
@@ -1013,6 +1302,7 @@ def main() -> None:
 
         with st.expander(tr("table", lang)):
             st.dataframe(compact_table(frame.head(50), lang), use_container_width=True, hide_index=True)
+    commit_live_metric_cycle()
 
     st.caption(tr("footer", lang))
 
