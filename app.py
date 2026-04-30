@@ -23,7 +23,7 @@ import yfinance as yf
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 logging.getLogger("urllib3").setLevel(logging.CRITICAL)
 
-APP_VERSION = "pre-move-momentum-scanner-explosive-runners-2026-04-30"
+APP_VERSION = "pre-move-momentum-scanner-ui-layout-polish-2026-04-30"
 YAHOO_SCREENER_URL = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
 YAHOO_TRENDING_URL = "https://query1.finance.yahoo.com/v1/finance/trending/US"
 NASDAQ_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
@@ -163,10 +163,12 @@ def round_cent(value: float) -> float:
 
 
 def status_tone(status: str) -> str:
-    if status in {"HOT RUNNER", "BREAKOUT IMMINENT"}:
-        return "red"
+    if status == "HOT RUNNER":
+        return "hot"
     if status == "VALID TRADE":
         return "green"
+    if status == "BREAKOUT IMMINENT":
+        return "purple"
     if status in {"❌ NO LONG", "INVALID DATA"}:
         return "red"
     return "orange"
@@ -174,7 +176,7 @@ def status_tone(status: str) -> str:
 
 def status_badge(status: str) -> str:
     tone = status_tone(status)
-    return f":{tone}[{status}]"
+    return f"<span class='pm-badge pm-badge-{tone}'>{status}</span>"
 
 
 def safe_request_json(url: str, params: dict[str, object], timeout: int = 4) -> dict[str, object]:
@@ -895,6 +897,8 @@ def apply_theme() -> None:
                 --text: #e5e7eb;
                 --green: #22c55e;
                 --orange: #f59e0b;
+                --purple: #8b5cf6;
+                --blue: #38bdf8;
                 --red: #ef4444;
                 --hot: #ff2d55;
             }
@@ -909,9 +913,9 @@ def apply_theme() -> None:
                 border-right: 1px solid #1f2937;
             }
             .block-container {
-                padding-top: 1.25rem;
+                padding-top: 1.2rem;
                 padding-bottom: 2rem;
-                max-width: 1680px;
+                max-width: 1760px;
             }
             h1, h2, h3 {
                 color: #f8fafc;
@@ -922,9 +926,9 @@ def apply_theme() -> None:
                 background: linear-gradient(180deg, var(--panel-2) 0%, var(--panel) 100%);
                 border: 1px solid var(--line);
                 border-radius: 16px;
-                padding: 1rem;
-                box-shadow: 0 14px 34px rgba(0, 0, 0, 0.24);
-                min-height: 96px;
+                padding: 0.85rem;
+                box-shadow: 0 14px 34px rgba(0, 0, 0, 0.22);
+                min-height: 82px;
             }
             div[data-testid="stDataFrame"] {
                 border: 1px solid var(--line);
@@ -942,8 +946,11 @@ def apply_theme() -> None:
                 background: linear-gradient(180deg, rgba(17, 26, 43, 0.96), rgba(11, 18, 32, 0.96));
                 box-shadow: 0 18px 42px rgba(0, 0, 0, 0.25);
             }
+            div[data-testid="stVerticalBlockBorderWrapper"] > div {
+                min-height: 360px;
+            }
             .pm-card-title {
-                font-size: clamp(1.6rem, 4vw, 2.2rem);
+                font-size: clamp(1.7rem, 3vw, 2.3rem);
                 line-height: 1;
                 font-weight: 800;
                 color: #f8fafc;
@@ -951,16 +958,37 @@ def apply_theme() -> None:
                 overflow: hidden;
                 text-overflow: ellipsis;
             }
-            .pm-card-subtle {
-                color: var(--muted);
-                font-size: 0.86rem;
-                margin-top: -0.25rem;
+            .pm-badge {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                border-radius: 999px;
+                padding: 0.3rem 0.72rem;
+                font-size: 0.78rem;
+                font-weight: 800;
+                letter-spacing: 0.01em;
+                white-space: nowrap;
+                max-width: 100%;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                border: 1px solid rgba(255, 255, 255, 0.12);
+            }
+            .pm-badge-green { color: #dcfce7; background: rgba(34, 197, 94, 0.16); border-color: rgba(34, 197, 94, 0.38); }
+            .pm-badge-orange { color: #ffedd5; background: rgba(245, 158, 11, 0.16); border-color: rgba(245, 158, 11, 0.38); }
+            .pm-badge-purple { color: #ede9fe; background: linear-gradient(135deg, rgba(56, 189, 248, 0.18), rgba(139, 92, 246, 0.22)); border-color: rgba(139, 92, 246, 0.46); }
+            .pm-badge-red { color: #fee2e2; background: rgba(239, 68, 68, 0.16); border-color: rgba(239, 68, 68, 0.42); }
+            .pm-badge-hot {
+                color: #fff;
+                background: linear-gradient(135deg, rgba(255, 45, 85, 0.9), rgba(249, 115, 22, 0.86));
+                border-color: rgba(255, 45, 85, 0.52);
+                box-shadow: 0 0 18px rgba(255, 45, 85, 0.24);
             }
             .pm-chip-row {
                 display: flex;
                 flex-wrap: wrap;
                 gap: 0.4rem;
-                margin-top: 0.45rem;
+                margin-top: 0.55rem;
+                min-height: 1.8rem;
             }
             .pm-chip {
                 display: inline-flex;
@@ -973,26 +1001,22 @@ def apply_theme() -> None:
                 font-size: 0.78rem;
                 white-space: nowrap;
             }
-            .pm-hot-card {
-                border: 1px solid rgba(255, 45, 85, 0.55);
-                border-radius: 16px;
-                padding: 0.65rem;
-                background: radial-gradient(circle at top right, rgba(255, 45, 85, 0.2), transparent 12rem);
-                box-shadow: 0 0 34px rgba(255, 45, 85, 0.16);
-                margin-bottom: 0.5rem;
+            .pm-card-note {
+                color: var(--muted);
+                font-size: 0.9rem;
+                line-height: 1.35;
+                margin-top: 0.35rem;
+                min-height: 2.45rem;
+                overflow: hidden;
             }
-            .pm-hot-label {
-                display: inline-flex;
-                align-items: center;
-                border-radius: 999px;
-                padding: 0.18rem 0.58rem;
-                font-size: 0.78rem;
-                font-weight: 800;
-                letter-spacing: 0.02em;
-                color: #fff;
-                background: linear-gradient(135deg, #ff2d55, #f97316);
-                box-shadow: 0 0 18px rgba(255, 45, 85, 0.35);
-                white-space: nowrap;
+            .pm-caution {
+                color: #fecaca;
+                background: rgba(239, 68, 68, 0.12);
+                border: 1px solid rgba(239, 68, 68, 0.28);
+                border-radius: 12px;
+                padding: 0.48rem 0.6rem;
+                font-size: 0.86rem;
+                margin-top: 0.55rem;
             }
             .pm-mobile-cards { display: none; }
             [data-testid="stDataFrame"] div,
@@ -1005,8 +1029,11 @@ def apply_theme() -> None:
                     padding-right: 0.9rem;
                 }
                 div[data-testid="stMetric"] {
-                    min-height: 82px;
-                    padding: 0.8rem;
+                    min-height: 76px;
+                    padding: 0.72rem;
+                }
+                div[data-testid="stVerticalBlockBorderWrapper"] > div {
+                    min-height: auto;
                 }
                 .pm-desktop-table,
                 div[data-testid="stDataFrame"] {
@@ -1041,31 +1068,25 @@ def render_priority_card(row: pd.Series) -> None:
                 chips.append(label)
         chips = chips[:3] or ["watching pressure"]
 
-        if hot_runner:
-            st.markdown("<div class='pm-hot-card'>", unsafe_allow_html=True)
-        head = st.columns([0.45, 0.27, 0.28])
+        head = st.columns([0.58, 0.42], vertical_alignment="center")
         head[0].markdown(f"<div class='pm-card-title'>{ticker}</div>", unsafe_allow_html=True)
-        if hot_runner:
-            head[1].markdown("<span class='pm-hot-label'>HOT RUNNER</span>", unsafe_allow_html=True)
-        else:
-            head[1].empty()
-        head[2].markdown(status_badge(status))
-        st.caption(str(row.get("Setup Type", "PRE-MOVE WATCH")))
+        head[1].markdown(status_badge(status), unsafe_allow_html=True)
 
         st.progress(min(max(score / 100, 0), 1), text=f"Pre-Move Score {fmt_score(score)}")
 
-        grid_top = st.columns(2)
+        grid_top = st.columns(2, gap="medium")
         grid_top[0].metric("Price", fmt_currency(row.get("Current Price")))
         grid_top[1].metric("Trigger", fmt_currency(row.get("Trigger Entry")))
-        grid_bottom = st.columns(2)
+        grid_bottom = st.columns(2, gap="medium")
         grid_bottom[0].metric("Stop", fmt_currency(row.get("Stop")))
         grid_bottom[1].metric("Target", fmt_currency(row.get("Target 1")))
 
         chip_html = "".join(f"<span class='pm-chip'>{chip}</span>" for chip in chips)
         st.markdown(f"<div class='pm-chip-row'>{chip_html}</div>", unsafe_allow_html=True)
-        st.caption(reason_text)
         if hot_runner:
-            st.markdown("</div>", unsafe_allow_html=True)
+            st.markdown("<div class='pm-caution'>Already moved — wait for pullback or clean reclaim.</div>", unsafe_allow_html=True)
+        else:
+            st.markdown(f"<div class='pm-card-note'>{reason_text}</div>", unsafe_allow_html=True)
 
 
 def compact_reason(value: object) -> str:
@@ -1086,10 +1107,10 @@ def make_compact_table(candidates: pd.DataFrame) -> pd.DataFrame:
                 "Price": fmt_currency(row.get("Current Price")),
                 "Trigger": fmt_currency(row.get("Trigger Entry")),
                 "Stop": fmt_currency(row.get("Stop")),
-                "Target 1": fmt_currency(row.get("Target 1")),
+                "Target": fmt_currency(row.get("Target 1")),
                 "RVOL": fmt_rvol(row.get("RVOL")),
                 "Gap %": fmt_pct(row.get("Gap %")),
-                "Reason": ("HOT RUNNER, " if hot_runner else "") + compact_reason(row.get("Why This May Run")),
+                "Reason": "already moved" if hot_runner else compact_reason(row.get("Why This May Run")),
             }
         )
     return pd.DataFrame(rows)
@@ -1119,13 +1140,25 @@ def render_dashboard(snap: dict[str, object]) -> None:
     if snap["error"]:
         st.error(str(snap["error"]))
 
-    st.subheader("High Priority Pre-Move")
-    top_priority = candidates.head(3)
-    if top_priority.empty:
-        st.info("No filtered pre-move candidates yet. Showing watched movers below.")
+    hot_mask = candidates.get("Hot Runner", pd.Series(False, index=candidates.index)).astype(bool) if not candidates.empty else pd.Series(dtype=bool)
+    explosive = candidates[hot_mask].head(3) if not candidates.empty else pd.DataFrame()
+    opportunities = candidates[~hot_mask].head(3) if not candidates.empty else pd.DataFrame()
+
+    st.subheader("Pre-Move Opportunities")
+    if opportunities.empty:
+        st.info("No clean pre-move opportunities yet.")
     else:
-        cols = st.columns(min(3, len(top_priority)), gap="large")
-        for index, (_, row) in enumerate(top_priority.iterrows()):
+        cols = st.columns(min(3, len(opportunities)), gap="large")
+        for index, (_, row) in enumerate(opportunities.iterrows()):
+            with cols[index % len(cols)]:
+                render_priority_card(row)
+
+    st.subheader("Explosive Runners — Already Moved")
+    if explosive.empty:
+        st.info("No explosive runners detected in the current scan.")
+    else:
+        cols = st.columns(min(3, len(explosive)), gap="large")
+        for index, (_, row) in enumerate(explosive.iterrows()):
             with cols[index % len(cols)]:
                 render_priority_card(row)
 
@@ -1144,7 +1177,7 @@ def render_dashboard(snap: dict[str, object]) -> None:
                 "Price": st.column_config.TextColumn("Price", width="small"),
                 "Trigger": st.column_config.TextColumn("Trigger", width="small"),
                 "Stop": st.column_config.TextColumn("Stop", width="small"),
-                "Target 1": st.column_config.TextColumn("Target 1", width="small"),
+                "Target": st.column_config.TextColumn("Target", width="small"),
                 "RVOL": st.column_config.TextColumn("RVOL", width="small"),
                 "Gap %": st.column_config.TextColumn("Gap %", width="small"),
                 "Reason": st.column_config.TextColumn("Reason", width="large"),
@@ -1156,6 +1189,7 @@ def render_dashboard(snap: dict[str, object]) -> None:
             detail_cols = [
                 "Ticker",
                 "Setup Type",
+                "Target 1",
                 "Target 2",
                 "Risk/Reward",
                 "Volume Accel",
