@@ -27,6 +27,15 @@ NASDAQ_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.tx
 OTHER_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
 YAHOO_GAINERS_URL = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
 VALID_TICKER_RE = re.compile(r"^[A-Z]{1,5}$")
+APP_CODE_VERSION = "2026-04-30-premarket-runner-debug-v2"
+
+SKIP_COUNTER_KEYS = [
+    "skipped_missing_data",
+    "skipped_price_filter",
+    "skipped_volume_filter",
+    "skipped_no_previous_close",
+    "skipped_no_momentum",
+]
 
 FALLBACK_TICKERS = [
     "BIYA",
@@ -79,6 +88,7 @@ class ScannerSettings:
 
 @dataclass
 class AppState:
+    code_version: str
     lock: threading.RLock
     stop_event: threading.Event
     settings: ScannerSettings
@@ -90,6 +100,8 @@ class AppState:
     last_scan_seconds: float
     scanned_count: int
     skipped_count: int
+    skip_counters: dict[str, int]
+    relaxed_scan_used: bool
     cycle_count: int
     error: Optional[str]
     download_cache: dict[tuple[str, str, str, bool], tuple[float, pd.DataFrame]]
@@ -100,6 +112,7 @@ class AppState:
 
 def make_empty_state() -> AppState:
     return AppState(
+        code_version=APP_CODE_VERSION,
         lock=threading.RLock(),
         stop_event=threading.Event(),
         settings=ScannerSettings(),
@@ -111,6 +124,8 @@ def make_empty_state() -> AppState:
         last_scan_seconds=0.0,
         scanned_count=0,
         skipped_count=0,
+        skip_counters={key: 0 for key in SKIP_COUNTER_KEYS},
+        relaxed_scan_used=False,
         cycle_count=0,
         error=None,
         download_cache={},
@@ -123,6 +138,17 @@ def make_empty_state() -> AppState:
 @st.cache_resource(show_spinner=False)
 def get_state() -> AppState:
     return make_empty_state()
+
+
+def empty_skip_counters() -> dict[str, int]:
+    return {key: 0 for key in SKIP_COUNTER_KEYS}
+
+
+def merge_skip_counters(base: dict[str, int], incoming: dict[str, int]) -> dict[str, int]:
+    merged = {key: int(base.get(key, 0)) for key in SKIP_COUNTER_KEYS}
+    for key, value in incoming.items():
+        merged[key] = merged.get(key, 0) + int(value)
+    return merged
 
 
 def round_cent(value: float) -> float:
@@ -551,40 +577,44 @@ def position_score(
     )
 
 
-def extract_candidate(ticker: str, state: AppState, settings: ScannerSettings) -> Optional[dict[str, object]]:
+def extract_candidate(ticker: str, state: AppState, settings: ScannerSettings) -> tuple[Optional[dict[str, object]], Optional[str]]:
     if not is_valid_ticker(ticker):
-        return None
+        return None, "skipped_missing_data"
     intraday = cached_download(ticker, state, settings)
     if intraday.empty:
-        return None
+        return None, "skipped_missing_data"
 
     today, regular = latest_session_rows(intraday)
     analysis_rows = regular if not regular.empty else today
     if today.empty or analysis_rows.empty:
-        return None
+        return None, "skipped_missing_data"
 
     current_price = float(today["Close"].iloc[-1])
     open_price = float(regular["Open"].iloc[0]) if not regular.empty else float(today["Open"].iloc[0])
     last_regular_price = float(regular["Close"].iloc[-1]) if not regular.empty else current_price
     previous_close = get_previous_close(ticker, state, settings)
+    data_quality = "confirmed previous close"
     if previous_close is None:
-        return None
-    historical_average_volume = get_average_volume(ticker, state, settings)
+        previous_close = open_price
+        data_quality = "estimated previous close"
+    if previous_close <= 0:
+        return None, "skipped_no_previous_close"
+
     day_high = float(today["High"].max())
     day_low = float(today["Low"].min())
     volume = int(today["Volume"].sum())
-
-    if volume < settings.min_volume:
-        return None
 
     gap_pct = ((current_price - previous_close) / previous_close) * 100 if previous_close > 0 else 0.0
     gain_pct = gap_pct
     premarket_gain_pct = gap_pct if gap_pct > 0 else 0.0
     after_hours_gain_pct = ((current_price - last_regular_price) / last_regular_price) * 100 if last_regular_price > 0 and len(today) > len(regular) else 0.0
     intraday_relative_volume = estimate_relative_volume(volume, analysis_rows)
-    daily_relative_volume = volume / historical_average_volume if historical_average_volume and historical_average_volume > 0 else 0.0
-    relative_volume = max(intraday_relative_volume, daily_relative_volume)
+    relative_volume = intraday_relative_volume
     near_high_pct = ((day_high - current_price) / current_price) * 100 if current_price > 0 else 100.0
+
+    if volume < settings.min_volume and gap_pct < 8.0 and near_high_pct > settings.near_high_threshold_pct:
+        return None, "skipped_volume_filter"
+
     volume_acceleration, candle_volume_spike = detect_volume_acceleration(analysis_rows, settings.volume_acceleration_threshold)
     volume_spike = candle_volume_spike or relative_volume >= settings.min_relative_volume
     compression_pct, tight_consolidation = detect_price_compression(analysis_rows, day_high, current_price)
@@ -605,7 +635,7 @@ def extract_candidate(ticker: str, state: AppState, settings: ScannerSettings) -
 
     price_in_range = current_price >= settings.min_price and current_price <= settings.max_price
     if not price_in_range and not high_price_runner_exception:
-        return None
+        return None, "skipped_price_filter"
 
     early_momentum = (
         premarket_runner
@@ -617,7 +647,7 @@ def extract_candidate(ticker: str, state: AppState, settings: ScannerSettings) -
         or halt_candidate
     )
     if not early_momentum:
-        return None
+        return None, "skipped_no_momentum"
 
     reason: list[str] = []
     if gap_pct >= 8.0:
@@ -661,6 +691,7 @@ def extract_candidate(ticker: str, state: AppState, settings: ScannerSettings) -
         "Ticker": ticker,
         "Current Price": round(current_price, 4),
         "Previous Close": round(previous_close, 4),
+        "Data Quality": data_quality,
         "Open": round(open_price, 4),
         "Day High": round(day_high, 4),
         "Day Low": round(day_low, 4),
@@ -669,7 +700,7 @@ def extract_candidate(ticker: str, state: AppState, settings: ScannerSettings) -
         "Intraday Gain %": round(gain_pct, 2),
         "After Hours Gain %": round(after_hours_gain_pct, 2),
         "Volume": volume,
-        "Average Volume": int(historical_average_volume or float(analysis_rows["Volume"].tail(20).mean()) * 78),
+        "Average Volume": int(float(analysis_rows["Volume"].tail(20).mean()) * 78),
         "Relative Volume": round(relative_volume, 2),
         "Near High %": round(near_high_pct, 2),
         "Volume Acceleration": volume_acceleration,
@@ -699,24 +730,51 @@ def extract_candidate(ticker: str, state: AppState, settings: ScannerSettings) -
         "Timestamp": datetime.now().isoformat(timespec="seconds"),
         "Reason": ", ".join(reason),
         "Scan Reason": ", ".join(scan_reason),
-    }
+    }, None
 
 
-def scan_market(state: AppState, settings: ScannerSettings) -> tuple[pd.DataFrame, int, int]:
+def relaxed_settings(settings: ScannerSettings) -> ScannerSettings:
+    return ScannerSettings(
+        fast_mode=settings.fast_mode,
+        scan_interval_seconds=settings.scan_interval_seconds,
+        min_price=settings.min_price,
+        max_price=200.0,
+        min_volume=0,
+        min_gain_pct=settings.min_gain_pct,
+        min_relative_volume=0.5,
+        near_high_threshold_pct=settings.near_high_threshold_pct,
+        volume_acceleration_threshold=settings.volume_acceleration_threshold,
+        halt_spike_threshold_pct=settings.halt_spike_threshold_pct,
+        max_tickers=settings.max_tickers,
+        active_movers_count=settings.active_movers_count,
+        explore_tickers_count=settings.explore_tickers_count,
+        batch_size=settings.batch_size,
+        max_workers=settings.max_workers,
+        output_limit=settings.output_limit,
+        cache_seconds=settings.cache_seconds,
+        request_timeout_seconds=settings.request_timeout_seconds,
+    )
+
+
+def scan_market_once(state: AppState, settings: ScannerSettings) -> tuple[pd.DataFrame, int, int, dict[str, int]]:
     tickers = build_scan_universe(state, settings)
     rows: list[dict[str, object]] = []
     skipped = 0
+    skip_counters = empty_skip_counters()
     workers = max(10, min(settings.max_workers, 25))
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {executor.submit(extract_candidate, ticker, state, settings): ticker for ticker in tickers}
         for future in as_completed(futures):
             try:
-                candidate = future.result(timeout=0)
+                candidate, skip_reason = future.result(timeout=0)
             except Exception:
                 candidate = None
+                skip_reason = "skipped_missing_data"
             if candidate is None:
                 skipped += 1
+                if skip_reason in skip_counters:
+                    skip_counters[skip_reason] += 1
             else:
                 rows.append(candidate)
 
@@ -741,7 +799,18 @@ def scan_market(state: AppState, settings: ScannerSettings) -> tuple[pd.DataFram
         blank_runner = df["Runner Label"].astype(str).eq("")
         top_blank_indexes = df[blank_runner].head(3).index
         df.loc[top_blank_indexes, "Runner Label"] = "HIGH POTENTIAL RUNNERS"
-    return df, skipped, len(tickers)
+    return df, skipped, len(tickers), skip_counters
+
+
+def scan_market(state: AppState, settings: ScannerSettings) -> tuple[pd.DataFrame, int, int, dict[str, int], bool]:
+    df, skipped, scanned, skip_counters = scan_market_once(state, settings)
+    if not df.empty:
+        return df, skipped, scanned, skip_counters, False
+
+    relaxed = relaxed_settings(settings)
+    relaxed_df, relaxed_skipped, relaxed_scanned, relaxed_counters = scan_market_once(state, relaxed)
+    combined_counters = merge_skip_counters(skip_counters, relaxed_counters)
+    return relaxed_df, skipped + relaxed_skipped, scanned + relaxed_scanned, combined_counters, True
 
 
 def get_value(row: pd.Series, column: str, default: float = 0.0) -> float:
@@ -790,6 +859,7 @@ def calculate_trade_plan(row: pd.Series) -> dict[str, object]:
     premarket_runner = bool(row.get("Premarket Runner", False))
     runner_label = str(row.get("Runner Label", "") or "")
     scan_reason = str(row.get("Reason", "") or row.get("Scan Reason", ""))
+    data_quality = str(row.get("Data Quality", "confirmed previous close") or "confirmed previous close")
 
     support_low = round_cent(max(day_low, current_price * 0.94))
     support_high = round_cent(max(support_low + 0.01, current_price * 0.975))
@@ -1015,6 +1085,7 @@ def calculate_trade_plan(row: pd.Series) -> dict[str, object]:
         "Price Near Entry": price_near_entry,
         "Runner Label": runner_label,
         "Reason": scan_reason,
+        "Data Quality": data_quality,
         "Near High %": round(near_high_pct, 2),
         "Volume Acceleration": round(volume_acceleration, 2),
         "Compression %": round(compression_pct, 2),
@@ -1072,7 +1143,7 @@ def scanner_loop(state: AppState) -> None:
 
         started = time.monotonic()
         try:
-            candidates_df, skipped, scanned = scan_market(state, settings)
+            candidates_df, skipped, scanned, skip_counters, relaxed_scan_used = scan_market(state, settings)
             plans_df = analyze_candidates(candidates_df)
             elapsed = time.monotonic() - started
             with state.lock:
@@ -1080,6 +1151,8 @@ def scanner_loop(state: AppState) -> None:
                 state.plans_df = plans_df
                 state.scanned_count = scanned
                 state.skipped_count = skipped
+                state.skip_counters = skip_counters
+                state.relaxed_scan_used = relaxed_scan_used
                 state.last_scan_seconds = elapsed
                 state.last_scan_finished = datetime.now().isoformat(timespec="seconds")
                 state.cycle_count += 1
@@ -1116,8 +1189,47 @@ def restart_scanner(state: AppState, settings: ScannerSettings) -> None:
         state.candidates_df = pd.DataFrame()
         state.plans_df = pd.DataFrame()
         state.error = None
+        state.skip_counters = empty_skip_counters()
+        state.relaxed_scan_used = False
         state.scanner_thread = threading.Thread(target=scanner_loop, args=(state,), daemon=True, name="momentum-scanner")
         state.scanner_thread.start()
+
+
+def reset_scanner_state(state: AppState, settings: Optional[ScannerSettings] = None) -> None:
+    new_settings = settings or ScannerSettings()
+    with state.lock:
+        old_thread = state.scanner_thread
+        state.stop_event.set()
+    if old_thread and old_thread.is_alive():
+        old_thread.join(timeout=1.5)
+    with state.lock:
+        state.code_version = APP_CODE_VERSION
+        state.stop_event = threading.Event()
+        state.settings = new_settings
+        state.candidates_df = pd.DataFrame()
+        state.plans_df = pd.DataFrame()
+        state.last_scan_started = None
+        state.last_scan_finished = None
+        state.last_scan_seconds = 0.0
+        state.scanned_count = 0
+        state.skipped_count = 0
+        state.skip_counters = empty_skip_counters()
+        state.relaxed_scan_used = False
+        state.cycle_count = 0
+        state.error = None
+        state.download_cache = {}
+        state.previous_close_cache = {}
+        state.average_volume_cache = {}
+        state.universe_cache = None
+        state.scanner_thread = threading.Thread(target=scanner_loop, args=(state,), daemon=True, name="momentum-scanner")
+        state.scanner_thread.start()
+
+
+def ensure_current_state_version(state: AppState) -> None:
+    with state.lock:
+        stale_version = getattr(state, "code_version", None) != APP_CODE_VERSION
+    if stale_version:
+        reset_scanner_state(state, ScannerSettings())
 
 
 def apply_theme() -> None:
@@ -1181,6 +1293,8 @@ def snapshot_state(state: AppState) -> dict[str, object]:
             "last_scan_seconds": state.last_scan_seconds,
             "scanned_count": state.scanned_count,
             "skipped_count": state.skipped_count,
+            "skip_counters": dict(state.skip_counters),
+            "relaxed_scan_used": state.relaxed_scan_used,
             "cycle_count": state.cycle_count,
             "error": state.error,
             "thread_alive": bool(state.scanner_thread and state.scanner_thread.is_alive()),
@@ -1194,6 +1308,9 @@ def sync_session_state(snapshot: dict[str, object]) -> None:
         "thread_alive": snapshot["thread_alive"],
         "cycle_count": snapshot["cycle_count"],
         "scanned_count": snapshot["scanned_count"],
+        "skipped_count": snapshot["skipped_count"],
+        "skip_counters": snapshot["skip_counters"],
+        "relaxed_scan_used": snapshot["relaxed_scan_used"],
         "candidate_count": len(snapshot["candidates_df"]),  # type: ignore[arg-type]
         "last_scan_seconds": snapshot["last_scan_seconds"],
         "last_scan_finished": snapshot["last_scan_finished"],
@@ -1233,27 +1350,46 @@ def render_dynamic_sections(
     candidates_df: pd.DataFrame = st.session_state["scanner_results"]
 
     with metrics_placeholder.container():
-        metrics = st.columns(5)
+        metrics = st.columns(6)
         metrics[0].metric("Scanner", "RUNNING" if metrics_data["thread_alive"] else "STOPPED")
         metrics[1].metric("Cycles", f"{int(metrics_data['cycle_count']):,}")
         metrics[2].metric("Scanned", f"{int(metrics_data['scanned_count']):,}")
         metrics[3].metric("Candidates", f"{len(candidates_df):,}")
-        metrics[4].metric("Last Scan", f"{float(metrics_data['last_scan_seconds']):.1f}s")
+        metrics[4].metric("Skipped", f"{int(metrics_data['skipped_count']):,}")
+        metrics[5].metric("Last Scan", f"{float(metrics_data['last_scan_seconds']):.1f}s")
 
     with status_placeholder.container():
         st.caption(f"Last updated: {st.session_state['last_update_time']} | Last scan finished: {metrics_data['last_scan_finished'] or 'Starting...'}")
+        if metrics_data["relaxed_scan_used"]:
+            st.info("No candidates passed the normal scan, so the scanner automatically relaxed to max_price 200, min_volume 0, and min_relative_volume 0.5 for this cycle.")
         if metrics_data["error"]:
             st.warning(f"Last scanner error: {metrics_data['error']}")
 
+        skip_counters = metrics_data.get("skip_counters", empty_skip_counters())
+        st.dataframe(
+            pd.DataFrame(
+                [{"Reason": key.replace("skipped_", "").replace("_", " "), "Count": int(skip_counters.get(key, 0))} for key in SKIP_COUNTER_KEYS]
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
     if plans_df.empty:
-        table_placeholder.info("No trade setups available yet. Scanner is still collecting data.")
+        skip_counters = metrics_data.get("skip_counters", empty_skip_counters())
+        top_skip = max(SKIP_COUNTER_KEYS, key=lambda key: int(skip_counters.get(key, 0)))
+        table_placeholder.warning(
+            "No candidates passed yet. "
+            f"Largest rejection bucket: {top_skip.replace('skipped_', '').replace('_', ' ')} "
+            f"({int(skip_counters.get(top_skip, 0)):,})."
+        )
         cards_placeholder.empty()
         detail_placeholder.empty()
         return
 
     top10 = plans_df.head(10)
     if top10.empty:
-        table_placeholder.info("No trade setups available yet. Scanner is still collecting data.")
+        skip_counters = metrics_data.get("skip_counters", empty_skip_counters())
+        table_placeholder.warning(f"No ranked setups after analysis. Skip counters: {skip_counters}")
         cards_placeholder.empty()
         detail_placeholder.empty()
         return
@@ -1264,6 +1400,7 @@ def render_dynamic_sections(
         "Status",
         "Setup Type",
         "Reason",
+        "Data Quality",
         "Current Price",
         "Gap %",
         "Premarket Gain %",
@@ -1336,6 +1473,7 @@ def main() -> None:
     apply_theme()
 
     state = get_state()
+    ensure_current_state_version(state)
     ensure_scanner_running(state)
     snap = snapshot_state(state)
     sync_session_state(snap)
@@ -1367,6 +1505,10 @@ def main() -> None:
 
         if st.button("Restart scanner", type="primary", use_container_width=True):
             restart_scanner(state, new_settings)
+
+        if st.button("Clear cache / Reset scanner state", use_container_width=True):
+            reset_scanner_state(state, ScannerSettings())
+            st.rerun()
 
         with state.lock:
             state.settings = new_settings
