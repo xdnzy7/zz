@@ -23,10 +23,13 @@ import yfinance as yf
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 logging.getLogger("urllib3").setLevel(logging.CRITICAL)
 
-APP_VERSION = "small-cap-explosive-runner-scanner-2026-04-30"
+APP_VERSION = "small-cap-explosive-discovery-layer-2026-04-30"
 YAHOO_SCREENER_URL = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
 YAHOO_TRENDING_URL = "https://query1.finance.yahoo.com/v1/finance/trending/US"
 NASDAQ_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
+STOCKANALYSIS_GAINERS_URL = "https://stockanalysis.com/markets/gainers/"
+FINVIZ_GAINERS_URL = "https://finviz.com/screener.ashx?v=111&s=ta_topgainers"
+TRADINGVIEW_GAINERS_URL = "https://www.tradingview.com/markets/stocks-usa/market-movers-gainers/"
 VALID_TICKER_RE = re.compile(r"^[A-Z]{1,5}$")
 
 SMALL_CAP_RUNNER_FALLBACK = [
@@ -52,7 +55,18 @@ SMALL_CAP_RUNNER_FALLBACK = [
 ]
 
 SKIP_KEYS = ["missing_data", "price_filter", "no_setup", "invalid_data"]
-SOURCE_NAMES = ["day_gainers", "most_actives", "trending", "premarket_movers", "nasdaq_fallback", "runner_fallback", "optional_watchlist"]
+SOURCE_NAMES = [
+    "day_gainers",
+    "most_actives",
+    "trending",
+    "premarket_movers",
+    "stockanalysis_gainers",
+    "finviz_gainers",
+    "tradingview_gainers",
+    "nasdaq_fallback",
+    "runner_fallback",
+    "optional_watchlist",
+]
 
 ACTIVE_QUOTE_CACHE: dict[str, dict[str, object]] = {}
 SECURITY_NAME_CACHE: dict[str, str] = {}
@@ -69,6 +83,7 @@ class ScannerSettings:
     max_price: float = 200.0
     min_volume: int = 0
     min_rvol_for_valid: float = 1.3
+    market_summary_scraper: bool = True
     optional_watchlist: str = ""
     request_timeout_seconds: int = 3
     cache_seconds: int = 20
@@ -151,6 +166,24 @@ def round_cent(value: float) -> float:
     return round(float(value) + 1e-9, 2)
 
 
+def parse_compact_number(value: object) -> float:
+    text = str(value or "").replace(",", "").replace("$", "").strip()
+    if not text:
+        return 0.0
+    multiplier = 1.0
+    suffix = text[-1:].upper()
+    if suffix == "K":
+        multiplier = 1_000
+        text = text[:-1]
+    elif suffix == "M":
+        multiplier = 1_000_000
+        text = text[:-1]
+    elif suffix == "B":
+        multiplier = 1_000_000_000
+        text = text[:-1]
+    return safe_float(text, 0.0) * multiplier
+
+
 def status_badge_text(status: str) -> str:
     if status == "VALID TRADE":
         return f":green[{status}]"
@@ -171,11 +204,27 @@ def request_json(url: str, params: Optional[dict[str, object]] = None, timeout: 
 
 
 def cache_quote(symbol: str, quote: dict[str, object]) -> None:
+    existing = ACTIVE_QUOTE_CACHE.get(symbol, {})
     ACTIVE_QUOTE_CACHE[symbol] = {
+        **existing,
         "price": quote.get("regularMarketPrice") or quote.get("preMarketPrice") or quote.get("postMarketPrice"),
         "previous_close": quote.get("regularMarketPreviousClose"),
         "change_pct": quote.get("regularMarketChangePercent") or quote.get("preMarketChangePercent"),
         "volume": quote.get("regularMarketVolume") or quote.get("preMarketVolume"),
+    }
+
+
+def cache_discovery_quote(symbol: str, source: str, price: object = None, gain_pct: object = None, volume: object = None) -> None:
+    existing = ACTIVE_QUOTE_CACHE.get(symbol, {})
+    parsed_price = parse_compact_number(price)
+    parsed_gain = safe_float(str(gain_pct or "").replace("%", ""), np.nan)
+    parsed_volume = parse_compact_number(volume)
+    ACTIVE_QUOTE_CACHE[symbol] = {
+        **existing,
+        "price": parsed_price or existing.get("price"),
+        "change_pct": parsed_gain if not np.isnan(parsed_gain) else existing.get("change_pct"),
+        "volume": parsed_volume or existing.get("volume"),
+        "discovery_source": source,
     }
 
 
@@ -212,6 +261,97 @@ def yahoo_trending(max_count: int) -> tuple[str, list[str]]:
             tickers.append(symbol)
             cache_quote(symbol, quote)
     return "trending", list(dict.fromkeys(tickers))[:max_count]
+
+
+def request_text(url: str, timeout: int = 5) -> str:
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    response = requests.get(url, headers=headers, timeout=timeout)
+    response.raise_for_status()
+    return response.text
+
+
+def stockanalysis_gainers(max_count: int) -> tuple[str, list[str]]:
+    try:
+        html = request_text(STOCKANALYSIS_GAINERS_URL)
+        tables = pd.read_html(StringIO(html))
+    except Exception:
+        return "stockanalysis_gainers", []
+
+    tickers: list[str] = []
+    for table in tables:
+        if "Symbol" not in table.columns:
+            continue
+        for _, row in table.head(max_count).iterrows():
+            symbol = str(row.get("Symbol", "")).upper().strip()
+            if not is_valid_ticker(symbol):
+                continue
+            tickers.append(symbol)
+            cache_discovery_quote(
+                symbol,
+                "stockanalysis_gainers",
+                row.get("Price"),
+                row.get("Change %") or row.get("% Change") or row.get("Change"),
+                row.get("Volume"),
+            )
+        break
+    return "stockanalysis_gainers", list(dict.fromkeys(tickers))[:max_count]
+
+
+def finviz_gainers(max_count: int) -> tuple[str, list[str]]:
+    try:
+        html = request_text(FINVIZ_GAINERS_URL)
+    except Exception:
+        return "finviz_gainers", []
+
+    pattern = re.compile(
+        r'quote\.ashx\?t=(?P<ticker>[A-Z]{1,5}).{0,250}?>(?P<price>\d+(?:\.\d+)?)</td>.{0,250}?>(?P<change>[-+]?\d+(?:\.\d+)?%)</td>.{0,250}?>(?P<volume>[\d,.KMB]+)</td>',
+        re.IGNORECASE | re.DOTALL,
+    )
+    tickers: list[str] = []
+    for match in pattern.finditer(html):
+        symbol = match.group("ticker").upper()
+        if not is_valid_ticker(symbol):
+            continue
+        tickers.append(symbol)
+        cache_discovery_quote(symbol, "finviz_gainers", match.group("price"), match.group("change"), match.group("volume"))
+        if len(tickers) >= max_count:
+            break
+    if not tickers:
+        for symbol in re.findall(r'quote\.ashx\?t=([A-Z]{1,5})', html):
+            symbol = symbol.upper()
+            if is_valid_ticker(symbol):
+                tickers.append(symbol)
+            if len(tickers) >= max_count:
+                break
+    return "finviz_gainers", list(dict.fromkeys(tickers))[:max_count]
+
+
+def tradingview_gainers(max_count: int) -> tuple[str, list[str]]:
+    try:
+        html = request_text(TRADINGVIEW_GAINERS_URL)
+    except Exception:
+        return "tradingview_gainers", []
+
+    tickers: list[str] = []
+    for symbol in re.findall(r'"(?:name|logoid|base_name|symbol)"\s*:\s*"NASDAQ:([A-Z]{1,5})"', html):
+        symbol = symbol.upper()
+        if is_valid_ticker(symbol):
+            tickers.append(symbol)
+        if len(tickers) >= max_count:
+            break
+    if not tickers:
+        for symbol in re.findall(r'/symbols/NASDAQ-([A-Z]{1,5})/', html):
+            symbol = symbol.upper()
+            if is_valid_ticker(symbol):
+                tickers.append(symbol)
+            if len(tickers) >= max_count:
+                break
+    for symbol in tickers:
+        cache_discovery_quote(symbol, "tradingview_gainers")
+    return "tradingview_gainers", list(dict.fromkeys(tickers))[:max_count]
 
 
 def nasdaq_fallback(state: AppState, max_count: int) -> list[str]:
@@ -253,6 +393,14 @@ def build_universe(state: AppState, settings: ScannerSettings) -> tuple[list[str
         yahoo_screen("premarket_movers", "pre_market_gainers", settings.max_tickers),
         yahoo_screen("premarket_movers", "pre_market_most_actives", settings.max_tickers),
     ]
+    if settings.market_summary_scraper:
+        source_results.extend(
+            [
+                stockanalysis_gainers(settings.max_tickers),
+                finviz_gainers(settings.max_tickers),
+                tradingview_gainers(settings.max_tickers),
+            ]
+        )
 
     tickers: list[str] = []
     source_by_ticker: dict[str, str] = {}
@@ -464,10 +612,73 @@ def premove_score(
     return round(min(score, 100), 1)
 
 
+def discovery_candidate(ticker: str, settings: ScannerSettings) -> tuple[Optional[dict[str, object]], Optional[dict[str, object]], str]:
+    quote = ACTIVE_QUOTE_CACHE.get(ticker, {})
+    price = safe_float(quote.get("price"), 0)
+    gain_pct = safe_float(quote.get("change_pct"), 0)
+    volume = int(safe_float(quote.get("volume"), 0))
+    if price <= 0 or gain_pct < 20:
+        return None, None, "missing_data"
+    if price < settings.min_price or price > settings.max_price:
+        return None, None, "price_filter"
+
+    pullback_low = round_cent(price * 0.88)
+    pullback_high = round_cent(price * 0.95)
+    trigger = round_cent(price * 1.03)
+    stop = round_cent(max(0.01, pullback_low * 0.97))
+    risk = max(trigger - stop, 0)
+    target_1 = round_cent(trigger + risk * 2) if risk > 0 else round_cent(price * 1.12)
+    target_2 = round_cent(trigger + risk * 3) if risk > 0 else round_cent(price * 1.18)
+    score = explosion_score(gain_pct, 0.0, 0.0, 0.0, volume)
+    reasons = [f"market summary shows +{gain_pct:.2f}%"]
+    if gain_pct >= 80:
+        reasons.append("80%+ extreme runner")
+    elif gain_pct >= 40:
+        reasons.append("40%+ explosive gainer")
+    else:
+        reasons.append("20%+ explosive gainer")
+    if volume > 0:
+        reasons.append("public source volume available")
+
+    row = {
+        "Ticker": ticker,
+        "Mode": "EXPLOSIVE",
+        "Current Price": round(price, 4),
+        "Gain %": round(gain_pct, 2),
+        "Gap %": round(gain_pct, 2),
+        "Intraday Gain %": round(gain_pct, 2),
+        "Last 2 Candle Move %": np.nan,
+        "Volume": volume,
+        "RVOL": 0.0,
+        "Volume Acceleration": 0.0,
+        "Near High %": 0.0,
+        "VWAP Reclaim": False,
+        "Tight Consolidation": False,
+        "Higher Lows": False,
+        "20D Breakout": False,
+        "Score": score,
+        "Explosion Score": score,
+        "Pre-Move Score": 0.0,
+        "Status": "HOT RUNNER — WAIT FOR PULLBACK" if gain_pct > 30 else "BREAKOUT IMMINENT",
+        "Setup Type": "Explosive Runner Now",
+        "Trigger Entry": trigger,
+        "Pullback Zone": f"{pullback_low:.2f}-{pullback_high:.2f}",
+        "Stop": stop,
+        "Target 1": target_1,
+        "Target 2": target_2,
+        "Risk/Reward": "1:2.00" if risk > 0 else "N/A",
+        "Reason": ", ".join(reasons),
+        "Avoid Reason": "Discovery-only runner; wait for pullback, VWAP reclaim, or fresh intraday confirmation.",
+        "Data Quality": f"market summary discovery: {quote.get('discovery_source', 'public source')}",
+        "Last Updated": datetime.now().isoformat(timespec="seconds"),
+    }
+    return row, row.copy(), ""
+
+
 def analyze_ticker(ticker: str, state: AppState, settings: ScannerSettings) -> tuple[Optional[dict[str, object]], Optional[dict[str, object]], str]:
     intraday = cached_download(ticker, state, settings, "1d", "5m", True)
     if intraday.empty:
-        return None, None, "missing_data"
+        return discovery_candidate(ticker, settings)
 
     today, regular = session_rows(intraday)
     analysis = regular if not regular.empty else today
@@ -499,8 +710,9 @@ def analyze_ticker(ticker: str, state: AppState, settings: ScannerSettings) -> t
     has_higher_lows = higher_lows(analysis)
     volume_ignition = accel >= 1.5
 
-    explosive_runner = intraday_gain_pct >= 10 or gap_pct >= 10 or last_2_move_pct >= 5 or accel >= 3
-    pre_move_candidate = near_high_pct <= 3 and (is_tight or has_higher_lows or vwap_reclaim or accel >= 1.5)
+    explosive_runner = gain_pct >= 20 or gap_pct >= 20 or last_2_move_pct >= 8 or accel >= 3
+    early_runner = gain_pct >= 5 and near_high_pct <= 5 and accel >= 1.5
+    pre_move_candidate = early_runner or (near_high_pct <= 3 and (is_tight or has_higher_lows or vwap_reclaim or accel >= 1.5))
     if not explosive_runner and not pre_move_candidate:
         watched = {
             "Ticker": ticker,
@@ -535,9 +747,13 @@ def analyze_ticker(ticker: str, state: AppState, settings: ScannerSettings) -> t
 
     reasons: list[str] = []
     if explosive_runner:
-        if gain_pct >= 10:
-            reasons.append("10%+ momentum")
-        if last_2_move_pct >= 5:
+        if gain_pct >= 20:
+            reasons.append("20%+ momentum")
+        if gain_pct >= 40:
+            reasons.append("40%+ explosive gainer")
+        if gain_pct >= 80:
+            reasons.append("80%+ extreme runner")
+        if last_2_move_pct >= 8:
             reasons.append("last 2 candles spike")
         if accel >= 3:
             reasons.append("volume acceleration >= 3x")
@@ -550,6 +766,8 @@ def analyze_ticker(ticker: str, state: AppState, settings: ScannerSettings) -> t
             reasons.append("VWAP reclaim")
         if volume_ignition:
             reasons.append("volume ignition starting")
+        if early_runner:
+            reasons.append("early runner pattern")
     if near_high_pct <= 3:
         reasons.append("near day high")
     if gap_pct > 0:
@@ -561,7 +779,7 @@ def analyze_ticker(ticker: str, state: AppState, settings: ScannerSettings) -> t
         status = "INVALID DATA"
     elif below_open_and_vwap:
         status = "WAIT FOR REVERSAL"
-    elif explosive_runner and (extended_from_pullback > 10 or gain_pct >= 18):
+    elif explosive_runner and gain_pct > 30:
         status = "HOT RUNNER — WAIT FOR PULLBACK"
     elif rvol < settings.min_rvol_for_valid:
         status = "BREAKOUT IMMINENT" if explosive_runner else "PRE-MOVE WATCH"
@@ -632,7 +850,10 @@ def split_and_rank(rows: list[dict[str, object]]) -> tuple[pd.DataFrame, pd.Data
         "INVALID DATA": 5,
     }
     df["_status_rank"] = df["Status"].map(status_rank).fillna(9)
-    explosive = df[df["Mode"].eq("EXPLOSIVE")].sort_values(["_status_rank", "Explosion Score", "RVOL"], ascending=[True, False, False])
+    explosive = df[df["Mode"].eq("EXPLOSIVE")].sort_values(
+        ["Gain %", "Volume", "Near High %", "Volume Acceleration", "Explosion Score"],
+        ascending=[False, False, True, False, False],
+    )
     premove = df[df["Mode"].eq("PREMOVE")].sort_values(["_status_rank", "Pre-Move Score", "RVOL"], ascending=[True, False, False])
     return explosive.drop(columns=["_status_rank"]), premove.drop(columns=["_status_rank"])
 
@@ -986,7 +1207,7 @@ def render_dashboard(snap: dict[str, object]) -> None:
         st.error(str(snap["error"]))
 
     render_section("Explosive Runners Now", explosive, "No explosive runners detected yet.")
-    render_section("Pre-Move Candidates", premove, "No high-quality pre-move candidates detected yet.")
+    render_section("Early Breakout Watch", premove, "No high-quality early breakout candidates detected yet.")
 
     st.subheader("Watched Movers")
     if watched.empty:
@@ -1044,6 +1265,7 @@ def main() -> None:
         scan_timeout = st.slider("Scan timeout seconds", 5, 30, settings.scan_timeout_seconds, step=1)
         max_price = st.slider("Maximum price", 1.0, 200.0, float(settings.max_price), step=1.0)
         min_rvol = st.slider("Minimum RVOL for VALID TRADE", 0.5, 3.0, float(settings.min_rvol_for_valid), step=0.1)
+        market_summary_scraper = st.toggle("Market Summary Scraper", value=settings.market_summary_scraper)
         with st.expander("Advanced", expanded=False):
             watchlist = st.text_area("Optional advanced watchlist", value=settings.optional_watchlist, height=80)
             st.caption("Automatic discovery is primary. Use this only to force-check names.")
@@ -1056,6 +1278,7 @@ def main() -> None:
             max_workers=int(workers),
             max_price=float(max_price),
             min_rvol_for_valid=float(min_rvol),
+            market_summary_scraper=market_summary_scraper,
             optional_watchlist=watchlist,
         )
         if st.button("Run scan now", type="primary", use_container_width=True):
