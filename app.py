@@ -1006,40 +1006,30 @@ def render_live_metric_card(
     delta_text = ("بدون تغيير" if is_arabic(lang) else "No change") if direction == "flat" else f"{arrow} {delta:+.2f}"
     formatted = format_live_value(value)
     value_text = value if isinstance(value, str) else ("N/A" if formatted == "N/A" else f"{prefix}{formatted}{suffix}")
-    st.markdown(
-        f"""
+    card_html = f"""
         <div class="live-metric-card {direction}">
-            <div class="live-metric-label">{html.escape(label)}</div>
-            <div class="live-metric-value">{html.escape(value_text)}</div>
+            <div class="live-metric-label">{html.escape(str(label))}</div>
+            <div class="live-metric-value">{html.escape(str(value_text))}</div>
             <div class="live-metric-delta {direction}">{html.escape(delta_text)}</div>
         </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    """
+    st.markdown(card_html, unsafe_allow_html=True)
+    return None
 
 
 def render_live_metric_grid(metrics: list[dict[str, Any]]) -> None:
-    cards = []
-    lang = st.session_state.get("language", "English")
-    for metric in metrics:
-        direction, delta = get_metric_direction(metric["key"], metric["value"])
-        arrow = {"up": "▲", "down": "▼", "flat": ""}[direction]
-        delta_text = ("بدون تغيير" if is_arabic(lang) else "No change") if direction == "flat" else f"{arrow} {delta:+.2f}"
-        raw_value = metric["value"]
-        formatted = format_live_value(raw_value)
-        value_text = str(raw_value) if isinstance(raw_value, str) else (
-            "N/A" if formatted == "N/A" else f"{metric.get('prefix', '')}{formatted}{metric.get('suffix', '')}"
-        )
-        cards.append(
-            f"""
-            <div class="live-metric-card {direction}">
-                <div class="live-metric-label">{html.escape(str(metric["label"]))}</div>
-                <div class="live-metric-value">{html.escape(value_text)}</div>
-                <div class="live-metric-delta {direction}">{html.escape(delta_text)}</div>
-            </div>
-            """
-        )
-    st.markdown(f"<div class=\"live-metric-grid\">{''.join(cards)}</div>", unsafe_allow_html=True)
+    for start in range(0, len(metrics), 4):
+        cols = st.columns(4)
+        for col, metric in zip(cols, metrics[start : start + 4]):
+            with col:
+                render_live_metric_card(
+                    label=str(metric["label"]),
+                    value=metric["value"],
+                    key=str(metric["key"]),
+                    prefix=str(metric.get("prefix", "")),
+                    suffix=str(metric.get("suffix", "")),
+                )
+    return None
 
 
 def render_trade_card(row: pd.Series, lang: str) -> None:
