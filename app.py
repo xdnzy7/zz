@@ -1,17 +1,12 @@
 from __future__ import annotations
 
-import contextlib
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from dataclasses import dataclass, field
-from datetime import datetime
-import io
-from io import StringIO
-import logging
-import random
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import math
 import re
-import threading
 import time
-from typing import Optional
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -20,1277 +15,1010 @@ import streamlit as st
 import yfinance as yf
 
 
-logging.getLogger("yfinance").setLevel(logging.CRITICAL)
-logging.getLogger("urllib3").setLevel(logging.CRITICAL)
+APP_TITLE = "Professional Momentum Scanner"
+APP_VERSION = "bilingual-professional-momentum-scanner-2026-04-30"
 
-APP_VERSION = "small-cap-explosive-discovery-layer-2026-04-30"
 YAHOO_SCREENER_URL = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
 YAHOO_TRENDING_URL = "https://query1.finance.yahoo.com/v1/finance/trending/US"
-NASDAQ_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
-STOCKANALYSIS_GAINERS_URL = "https://stockanalysis.com/markets/gainers/"
-FINVIZ_GAINERS_URL = "https://finviz.com/screener.ashx?v=111&s=ta_topgainers"
-TRADINGVIEW_GAINERS_URL = "https://www.tradingview.com/markets/stocks-usa/market-movers-gainers/"
+YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
 VALID_TICKER_RE = re.compile(r"^[A-Z]{1,5}$")
 
-SMALL_CAP_RUNNER_FALLBACK = [
-    "HCAI",
-    "MRAM",
-    "AKAN",
-    "MXL",
-    "RDAC",
-    "BIYA",
-    "SBLX",
-    "ATER",
-    "HOLO",
-    "GNS",
-    "LUCY",
-    "WISA",
-    "FFIE",
-    "TIVC",
+CLOUD_MAX_TICKERS = 150
+CLOUD_WORKERS = 8
+CLOUD_SCAN_TIMEOUT = 20
+CLOUD_SCAN_INTERVAL = 60
+
+FALLBACK_RUNNERS = [
     "SOUN",
     "BBAI",
     "KULR",
     "OPEN",
     "PLUG",
+    "MARA",
+    "RIOT",
+    "HOLO",
+    "GNS",
+    "FFIE",
+    "LUCY",
+    "WISA",
+    "TIVC",
+    "ATER",
+    "GFAI",
+    "CXAI",
+    "WULF",
+    "BITF",
+    "QBTS",
+    "IONQ",
+    "RGTI",
+    "SERV",
+    "LUNR",
+    "ACHR",
 ]
 
-SKIP_KEYS = ["missing_data", "price_filter", "no_setup", "invalid_data"]
-SOURCE_NAMES = [
-    "day_gainers",
-    "most_actives",
-    "trending",
-    "premarket_movers",
-    "stockanalysis_gainers",
-    "finviz_gainers",
-    "tradingview_gainers",
-    "nasdaq_fallback",
-    "runner_fallback",
-    "optional_watchlist",
-]
+SETUP_LABELS = {
+    "BREAKOUT WATCH": "مراقبة اختراق",
+    "DIP BUY ZONE": "منطقة شراء على النزول",
+    "MOMENTUM TRIGGER": "تفعيل الزخم",
+    "NHOD MOMENTUM": "أعلى سعر جديد اليوم",
+    "SCALP ONLY": "مضاربة سريعة فقط",
+    "WAIT FOR PULLBACK": "انتظر رجوع السعر",
+    "WAIT FOR REVERSAL": "انتظر انعكاس",
+    "TOO LATE / AVOID": "متأخر / تجنب",
+    "INVALID DATA": "بيانات غير صالحة",
+}
 
-ACTIVE_QUOTE_CACHE: dict[str, dict[str, object]] = {}
-SECURITY_NAME_CACHE: dict[str, str] = {}
+TEXT = {
+    "English": {
+        "page_title": "Professional Small-Cap Momentum Scanner",
+        "subtitle": "Automatic hot ticker discovery, conservative setup classification, and trade plans built from live price, levels, volume, and risk.",
+        "language": "Language",
+        "refresh": "Scan now",
+        "last_scan": "Last scan",
+        "next_refresh": "Auto refresh window",
+        "universe": "Tickers scanned",
+        "valid": "Valid trade plans",
+        "hot": "Hot movers",
+        "stale": "stale",
+        "scanner_controls": "Scanner controls",
+        "cloud_fast": "Cloud fast mode",
+        "advanced_watchlist": "Optional advanced watchlist",
+        "advanced_help": "Optional only. The scanner already discovers tickers automatically.",
+        "sources": "Discovery sources",
+        "explosive": "Explosive Runners Now",
+        "breakout": "Breakout Watch",
+        "dip": "Dip Buy Zones",
+        "watched": "Watched Movers",
+        "table": "Compact table",
+        "details": "Extra details",
+        "no_results": "No clean setups in this section yet. The scanner is intentionally selective.",
+        "ticker": "Ticker",
+        "setup": "Setup",
+        "current": "Current price",
+        "break": "Break level",
+        "dip_zone": "Dip zone",
+        "stop": "Stop",
+        "target1": "Target 1",
+        "target2": "Target 2",
+        "rr": "Risk/reward",
+        "confirmation": "Confirmation",
+        "invalidation": "Invalidation",
+        "why": "Why this works",
+        "avoid": "Avoid if",
+        "price": "Price",
+        "gain": "Gain",
+        "rvol": "RVOL",
+        "vol_acc": "Vol accel",
+        "near_high": "Near high",
+        "gap": "Gap",
+        "status": "Trade status",
+        "mode": "Scanner mode",
+        "source": "Source",
+        "footer": "Not financial advice. The app does not predict outcomes; it filters conditions and forces risk checks.",
+    },
+    "Arabic": {
+        "page_title": "ماسح احترافي لأسهم الزخم الصغيرة",
+        "subtitle": "اكتشاف تلقائي للأسهم النشطة، تصنيف محافظ للفرص، وخطة تداول مبنية على السعر والمستويات والحجم والمخاطرة.",
+        "language": "اللغة",
+        "refresh": "افحص الآن",
+        "last_scan": "آخر فحص",
+        "next_refresh": "نافذة التحديث التلقائي",
+        "universe": "عدد الرموز المفحوصة",
+        "valid": "خطط صالحة",
+        "hot": "أسهم نشطة",
+        "stale": "قديم",
+        "scanner_controls": "إعدادات الماسح",
+        "cloud_fast": "وضع السحابة السريع",
+        "advanced_watchlist": "قائمة مراقبة متقدمة اختيارية",
+        "advanced_help": "اختياري فقط. الماسح يكتشف الرموز تلقائيا.",
+        "sources": "مصادر الاكتشاف",
+        "explosive": "الأسهم المنفجرة الآن",
+        "breakout": "مراقبة الاختراق",
+        "dip": "مناطق الشراء على النزول",
+        "watched": "أسهم تحت المراقبة",
+        "table": "جدول مختصر",
+        "details": "تفاصيل إضافية",
+        "no_results": "لا توجد فرص نظيفة في هذا القسم حاليا. الماسح انتقائي عمدا.",
+        "ticker": "الرمز",
+        "setup": "نوع الفرصة",
+        "current": "السعر الحالي",
+        "break": "مستوى الاختراق",
+        "dip_zone": "منطقة الشراء على النزول",
+        "stop": "وقف الخسارة",
+        "target1": "الهدف الأول",
+        "target2": "الهدف الثاني",
+        "rr": "العائد مقابل المخاطرة",
+        "confirmation": "التأكيد",
+        "invalidation": "الإلغاء",
+        "why": "لماذا قد تعمل الفرصة",
+        "avoid": "تجنب إذا",
+        "price": "السعر",
+        "gain": "الصعود",
+        "rvol": "الحجم النسبي",
+        "vol_acc": "تسارع الحجم",
+        "near_high": "القرب من القمة",
+        "gap": "الفجوة",
+        "status": "حالة الخطة",
+        "mode": "وضع الماسح",
+        "source": "المصدر",
+        "footer": "ليست نصيحة مالية. التطبيق لا يتنبأ؛ بل يرشح الشروط ويفرض فحص المخاطرة.",
+    },
+}
 
 
-@dataclass
-class ScannerSettings:
-    cloud_fast_mode: bool = True
-    scan_interval_seconds: int = 60
-    scan_timeout_seconds: int = 20
-    max_tickers: int = 150
-    max_workers: int = 8
+@dataclass(frozen=True)
+class ScanConfig:
+    max_tickers: int = CLOUD_MAX_TICKERS
+    workers: int = CLOUD_WORKERS
+    scan_timeout: int = CLOUD_SCAN_TIMEOUT
+    scan_interval: int = CLOUD_SCAN_INTERVAL
     min_price: float = 0.2
-    max_price: float = 200.0
-    min_volume: int = 0
-    min_rvol_for_valid: float = 1.3
-    market_summary_scraper: bool = True
-    optional_watchlist: str = ""
-    request_timeout_seconds: int = 3
-    cache_seconds: int = 20
+    max_price: float = 50.0
+    min_volume: int = 100_000
+    request_timeout: int = 5
+    max_cards_per_section: int = 5
 
 
 @dataclass
-class AppState:
-    version: str = APP_VERSION
-    lock: threading.RLock = field(default_factory=threading.RLock)
-    stop_event: threading.Event = field(default_factory=threading.Event)
-    scanner_thread: Optional[threading.Thread] = None
-    settings: ScannerSettings = field(default_factory=ScannerSettings)
-    explosive_df: pd.DataFrame = field(default_factory=pd.DataFrame)
-    premove_df: pd.DataFrame = field(default_factory=pd.DataFrame)
-    watched_df: pd.DataFrame = field(default_factory=pd.DataFrame)
-    source_debug_df: pd.DataFrame = field(default_factory=pd.DataFrame)
-    skip_counts: dict[str, int] = field(default_factory=lambda: {key: 0 for key in SKIP_KEYS})
-    cycle_count: int = 0
-    scanned_count: int = 0
-    last_scan_started: Optional[str] = None
-    last_scan_finished: Optional[str] = None
-    last_scan_seconds: float = 0.0
-    timed_out: bool = False
-    status_text: str = "Starting scanner..."
-    source_message: Optional[str] = None
-    error: Optional[str] = None
-    intraday_cache: dict[str, tuple[float, pd.DataFrame]] = field(default_factory=dict)
-    daily_cache: dict[str, tuple[float, pd.DataFrame]] = field(default_factory=dict)
-    universe_cache: tuple[float, list[str]] | None = None
+class DiscoveryResult:
+    tickers: list[str]
+    sources: dict[str, int]
+    message: str
 
 
-@st.cache_resource(show_spinner=False)
-def get_state() -> AppState:
-    return AppState()
+def tr(key: str, lang: str) -> str:
+    return TEXT[lang][key]
 
 
-def is_valid_ticker(ticker: str) -> bool:
-    return bool(VALID_TICKER_RE.fullmatch(str(ticker).upper().strip()))
+def ar_setup(label: str) -> str:
+    return SETUP_LABELS.get(label, label)
 
 
-def parse_tickers(value: str) -> list[str]:
-    tickers = [part.upper().strip() for part in re.split(r"[\s,;]+", value or "")]
-    return [ticker for ticker in dict.fromkeys(tickers) if is_valid_ticker(ticker)]
+def is_arabic(lang: str) -> bool:
+    return lang == "Arabic"
 
 
-def safe_float(value: object, default: float = 0.0) -> float:
+def setup_text(label: str, lang: str) -> str:
+    return ar_setup(label) if is_arabic(lang) else label
+
+
+def safe_float(value: Any, default: float = np.nan) -> float:
     try:
         number = float(value)
     except (TypeError, ValueError):
         return default
-    if np.isnan(number) or np.isinf(number):
+    if not math.isfinite(number):
         return default
     return number
 
 
-def fmt_currency(value: object) -> str:
+def safe_int(value: Any, default: int = 0) -> int:
     number = safe_float(value, np.nan)
-    return "N/A" if np.isnan(number) else f"${number:.2f}"
+    return default if np.isnan(number) else int(number)
 
 
-def fmt_pct(value: object) -> str:
+def clean_symbol(symbol: Any) -> str | None:
+    value = str(symbol or "").upper().strip().replace(".", "-")
+    if VALID_TICKER_RE.fullmatch(value):
+        return value
+    return None
+
+
+def dedupe(items: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        symbol = clean_symbol(item)
+        if symbol and symbol not in seen:
+            seen.add(symbol)
+            result.append(symbol)
+    return result
+
+
+def fmt_money(value: Any) -> str:
     number = safe_float(value, np.nan)
-    return "N/A" if np.isnan(number) else f"{number:.2f}%"
+    if np.isnan(number):
+        return "N/A"
+    digits = 4 if number < 1 else 2
+    return f"${number:,.{digits}f}"
 
 
-def fmt_rvol(value: object) -> str:
+def fmt_pct(value: Any) -> str:
     number = safe_float(value, np.nan)
-    return "N/A" if np.isnan(number) else f"{number:.2f}"
+    return "N/A" if np.isnan(number) else f"{number:.1f}%"
 
 
-def fmt_score(value: object) -> str:
-    return f"{safe_float(value, 0):.0f}/100"
+def fmt_x(value: Any) -> str:
+    number = safe_float(value, np.nan)
+    return "N/A" if np.isnan(number) else f"{number:.2f}x"
 
 
-def fmt_num(value: object) -> str:
-    return f"{int(safe_float(value, 0)):,}"
+def fmt_rr(value: Any) -> str:
+    number = safe_float(value, np.nan)
+    return "N/A" if np.isnan(number) else f"1:{number:.2f}"
 
 
-def round_cent(value: float) -> float:
-    return round(float(value) + 1e-9, 2)
+def now_utc_ts() -> float:
+    return datetime.now(timezone.utc).timestamp()
 
 
-def parse_compact_number(value: object) -> float:
-    text = str(value or "").replace(",", "").replace("$", "").strip()
-    if not text:
-        return 0.0
-    multiplier = 1.0
-    suffix = text[-1:].upper()
-    if suffix == "K":
-        multiplier = 1_000
-        text = text[:-1]
-    elif suffix == "M":
-        multiplier = 1_000_000
-        text = text[:-1]
-    elif suffix == "B":
-        multiplier = 1_000_000_000
-        text = text[:-1]
-    return safe_float(text, 0.0) * multiplier
+def utc_clock(ts: float | None) -> str:
+    if not ts:
+        return "N/A"
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%H:%M:%S UTC")
 
 
-def status_badge_text(status: str) -> str:
-    if status == "VALID TRADE":
-        return f":green[{status}]"
-    if status in {"INVALID DATA", "NO LONG"}:
-        return f":red[{status}]"
-    if status.startswith("HOT RUNNER"):
-        return f":red[{status}]"
-    if status == "BREAKOUT IMMINENT":
-        return f":violet[{status}]"
-    return f":orange[{status}]"
-
-
-def request_json(url: str, params: Optional[dict[str, object]] = None, timeout: int = 4) -> dict[str, object]:
+def request_json(url: str, params: dict[str, Any] | None = None, timeout: int = 5) -> dict[str, Any]:
     headers = {"User-Agent": "Mozilla/5.0"}
     response = requests.get(url, params=params or {}, headers=headers, timeout=timeout)
     response.raise_for_status()
     return response.json()
 
 
-def cache_quote(symbol: str, quote: dict[str, object]) -> None:
-    existing = ACTIVE_QUOTE_CACHE.get(symbol, {})
-    ACTIVE_QUOTE_CACHE[symbol] = {
-        **existing,
-        "price": quote.get("regularMarketPrice") or quote.get("preMarketPrice") or quote.get("postMarketPrice"),
-        "previous_close": quote.get("regularMarketPreviousClose"),
-        "change_pct": quote.get("regularMarketChangePercent") or quote.get("preMarketChangePercent"),
-        "volume": quote.get("regularMarketVolume") or quote.get("preMarketVolume"),
-    }
-
-
-def cache_discovery_quote(symbol: str, source: str, price: object = None, gain_pct: object = None, volume: object = None) -> None:
-    existing = ACTIVE_QUOTE_CACHE.get(symbol, {})
-    parsed_price = parse_compact_number(price)
-    parsed_gain = safe_float(str(gain_pct or "").replace("%", ""), np.nan)
-    parsed_volume = parse_compact_number(volume)
-    ACTIVE_QUOTE_CACHE[symbol] = {
-        **existing,
-        "price": parsed_price or existing.get("price"),
-        "change_pct": parsed_gain if not np.isnan(parsed_gain) else existing.get("change_pct"),
-        "volume": parsed_volume or existing.get("volume"),
-        "discovery_source": source,
-    }
-
-
-def yahoo_screen(source_name: str, screen_id: str, max_count: int) -> tuple[str, list[str]]:
-    try:
-        data = request_json(YAHOO_SCREENER_URL, {"scrIds": screen_id, "count": min(max_count, 250)})
-        quotes = data["finance"]["result"][0]["quotes"]  # type: ignore[index]
-    except Exception:
-        return source_name, []
-
-    tickers: list[str] = []
-    for quote in quotes:
-        symbol = str(quote.get("symbol", "")).upper().strip()
-        quote_type = str(quote.get("quoteType", "")).upper()
-        market = str(quote.get("market", "")).lower()
-        if quote_type == "EQUITY" and market in {"us_market", ""} and is_valid_ticker(symbol):
-            tickers.append(symbol)
-            cache_quote(symbol, quote)
-    return source_name, list(dict.fromkeys(tickers))
-
-
-def yahoo_trending(max_count: int) -> tuple[str, list[str]]:
-    try:
-        data = request_json(YAHOO_TRENDING_URL)
-        quotes = data["finance"]["result"][0]["quotes"]  # type: ignore[index]
-    except Exception:
-        return "trending", []
-
-    tickers: list[str] = []
-    for quote in quotes:
-        symbol = str(quote.get("symbol", "")).upper().strip()
-        quote_type = str(quote.get("quoteType", "")).upper()
-        if quote_type in {"", "EQUITY"} and is_valid_ticker(symbol):
-            tickers.append(symbol)
-            cache_quote(symbol, quote)
-    return "trending", list(dict.fromkeys(tickers))[:max_count]
-
-
-def request_text(url: str, timeout: int = 5) -> str:
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    }
-    response = requests.get(url, headers=headers, timeout=timeout)
-    response.raise_for_status()
-    return response.text
-
-
-def stockanalysis_gainers(max_count: int) -> tuple[str, list[str]]:
-    try:
-        html = request_text(STOCKANALYSIS_GAINERS_URL)
-        tables = pd.read_html(StringIO(html))
-    except Exception:
-        return "stockanalysis_gainers", []
-
-    tickers: list[str] = []
-    for table in tables:
-        if "Symbol" not in table.columns:
-            continue
-        for _, row in table.head(max_count).iterrows():
-            symbol = str(row.get("Symbol", "")).upper().strip()
-            if not is_valid_ticker(symbol):
-                continue
-            tickers.append(symbol)
-            cache_discovery_quote(
-                symbol,
-                "stockanalysis_gainers",
-                row.get("Price"),
-                row.get("Change %") or row.get("% Change") or row.get("Change"),
-                row.get("Volume"),
-            )
-        break
-    return "stockanalysis_gainers", list(dict.fromkeys(tickers))[:max_count]
-
-
-def finviz_gainers(max_count: int) -> tuple[str, list[str]]:
-    try:
-        html = request_text(FINVIZ_GAINERS_URL)
-    except Exception:
-        return "finviz_gainers", []
-
-    pattern = re.compile(
-        r'quote\.ashx\?t=(?P<ticker>[A-Z]{1,5}).{0,250}?>(?P<price>\d+(?:\.\d+)?)</td>.{0,250}?>(?P<change>[-+]?\d+(?:\.\d+)?%)</td>.{0,250}?>(?P<volume>[\d,.KMB]+)</td>',
-        re.IGNORECASE | re.DOTALL,
+def yahoo_screener(scr_id: str, count: int, timeout: int) -> list[str]:
+    payload = request_json(
+        YAHOO_SCREENER_URL,
+        params={"scrIds": scr_id, "count": count},
+        timeout=timeout,
     )
-    tickers: list[str] = []
-    for match in pattern.finditer(html):
-        symbol = match.group("ticker").upper()
-        if not is_valid_ticker(symbol):
+    quotes = (
+        payload.get("finance", {})
+        .get("result", [{}])[0]
+        .get("quotes", [])
+    )
+    return dedupe([quote.get("symbol") for quote in quotes])
+
+
+def yahoo_trending(timeout: int) -> list[str]:
+    payload = request_json(YAHOO_TRENDING_URL, timeout=timeout)
+    quotes = payload.get("finance", {}).get("result", [{}])[0].get("quotes", [])
+    return dedupe([quote.get("symbol") for quote in quotes])
+
+
+def yahoo_premarket(timeout: int) -> list[str]:
+    candidates = ["premarket_gainers", "premarket_movers", "day_losers"]
+    found: list[str] = []
+    for scr_id in candidates:
+        try:
+            found.extend(yahoo_screener(scr_id, 35, timeout))
+        except Exception:
             continue
-        tickers.append(symbol)
-        cache_discovery_quote(symbol, "finviz_gainers", match.group("price"), match.group("change"), match.group("volume"))
-        if len(tickers) >= max_count:
-            break
-    if not tickers:
-        for symbol in re.findall(r'quote\.ashx\?t=([A-Z]{1,5})', html):
-            symbol = symbol.upper()
-            if is_valid_ticker(symbol):
-                tickers.append(symbol)
-            if len(tickers) >= max_count:
-                break
-    return "finviz_gainers", list(dict.fromkeys(tickers))[:max_count]
+    return dedupe(found)
 
 
-def tradingview_gainers(max_count: int) -> tuple[str, list[str]]:
-    try:
-        html = request_text(TRADINGVIEW_GAINERS_URL)
-    except Exception:
-        return "tradingview_gainers", []
-
-    tickers: list[str] = []
-    for symbol in re.findall(r'"(?:name|logoid|base_name|symbol)"\s*:\s*"NASDAQ:([A-Z]{1,5})"', html):
-        symbol = symbol.upper()
-        if is_valid_ticker(symbol):
-            tickers.append(symbol)
-        if len(tickers) >= max_count:
-            break
-    if not tickers:
-        for symbol in re.findall(r'/symbols/NASDAQ-([A-Z]{1,5})/', html):
-            symbol = symbol.upper()
-            if is_valid_ticker(symbol):
-                tickers.append(symbol)
-            if len(tickers) >= max_count:
-                break
-    for symbol in tickers:
-        cache_discovery_quote(symbol, "tradingview_gainers")
-    return "tradingview_gainers", list(dict.fromkeys(tickers))[:max_count]
+def parse_watchlist(value: str) -> list[str]:
+    parts = re.split(r"[\s,;]+", value or "")
+    return dedupe(parts)
 
 
-def nasdaq_fallback(state: AppState, max_count: int) -> list[str]:
-    global SECURITY_NAME_CACHE
-    now = time.monotonic()
-    with state.lock:
-        if state.universe_cache and now - state.universe_cache[0] <= 900:
-            return state.universe_cache[1][:max_count]
-
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        text = requests.get(NASDAQ_LISTED_URL, headers=headers, timeout=4).text
-        df = pd.read_csv(StringIO(text), sep="|")
-        df = df[df["Symbol"].notna()]
-        df = df[df["Symbol"] != "File Creation Time"]
-        df = df.rename(columns={"Symbol": "Ticker", "Security Name": "Name"})
-        df["Ticker"] = df["Ticker"].astype(str).str.upper().str.strip()
-        df["Name"] = df["Name"].fillna("").astype(str).str.lower()
-        df = df[[is_valid_ticker(ticker) for ticker in df["Ticker"]]]
-        if "ETF" in df:
-            df = df[df["ETF"].astype(str).str.upper().ne("Y")]
-        if "Test Issue" in df:
-            df = df[df["Test Issue"].astype(str).str.upper().ne("Y")]
-        SECURITY_NAME_CACHE = dict(zip(df["Ticker"], df["Name"]))
-        tickers = df["Ticker"].drop_duplicates().tolist()
-    except Exception:
-        tickers = SMALL_CAP_RUNNER_FALLBACK
-
-    with state.lock:
-        state.universe_cache = (now, tickers)
-    return tickers[:max_count]
-
-
-def build_universe(state: AppState, settings: ScannerSettings) -> tuple[list[str], list[dict[str, object]], dict[str, str], Optional[str]]:
-    source_results = [
-        yahoo_screen("day_gainers", "day_gainers", settings.max_tickers),
-        yahoo_screen("most_actives", "most_actives", settings.max_tickers),
-        yahoo_trending(settings.max_tickers),
-        yahoo_screen("premarket_movers", "pre_market_gainers", settings.max_tickers),
-        yahoo_screen("premarket_movers", "pre_market_most_actives", settings.max_tickers),
-    ]
-    if settings.market_summary_scraper:
-        source_results.extend(
-            [
-                stockanalysis_gainers(settings.max_tickers),
-                finviz_gainers(settings.max_tickers),
-                tradingview_gainers(settings.max_tickers),
-            ]
-        )
-
-    tickers: list[str] = []
-    source_by_ticker: dict[str, str] = {}
-    debug: dict[str, dict[str, object]] = {
-        source: {"Source": source, "Fetched": 0, "Scanned": 0, "Passed Filters": 0} for source in SOURCE_NAMES
+@st.cache_data(ttl=60, show_spinner=False)
+def discover_tickers(optional_watchlist: str, max_tickers: int, request_timeout: int) -> DiscoveryResult:
+    sources: dict[str, list[str]] = {}
+    source_calls = {
+        "Yahoo day_gainers": lambda: yahoo_screener("day_gainers", 80, request_timeout),
+        "Yahoo most_actives": lambda: yahoo_screener("most_actives", 80, request_timeout),
+        "Yahoo trending": lambda: yahoo_trending(request_timeout),
+        "Yahoo premarket": lambda: yahoo_premarket(request_timeout),
     }
 
-    for source, source_tickers in source_results:
-        unique_source_tickers = list(dict.fromkeys(source_tickers))
-        debug[source]["Fetched"] = int(debug[source]["Fetched"]) + len(unique_source_tickers)
-        for ticker in unique_source_tickers:
-            tickers.append(ticker)
-            source_by_ticker.setdefault(ticker, source)
+    for name, loader in source_calls.items():
+        try:
+            sources[name] = loader()
+        except Exception:
+            sources[name] = []
 
-    optional = parse_tickers(settings.optional_watchlist)
+    optional = parse_watchlist(optional_watchlist)
     if optional:
-        debug["optional_watchlist"]["Fetched"] = len(optional)
-        for ticker in optional:
-            tickers.append(ticker)
-            source_by_ticker.setdefault(ticker, "optional_watchlist")
+        sources["Optional watchlist"] = optional
 
-    source_message = None
-    if not tickers:
-        source_message = "Active movers source unavailable"
-        fallback = nasdaq_fallback(state, settings.max_tickers)
-        debug["nasdaq_fallback"]["Fetched"] = len(fallback)
-        for ticker in fallback:
-            tickers.append(ticker)
-            source_by_ticker.setdefault(ticker, "nasdaq_fallback")
+    merged: list[str] = []
+    for symbols in sources.values():
+        merged.extend(symbols)
 
-    for ticker in SMALL_CAP_RUNNER_FALLBACK:
-        tickers.append(ticker)
-        source_by_ticker.setdefault(ticker, "runner_fallback")
-    debug["runner_fallback"]["Fetched"] = len(SMALL_CAP_RUNNER_FALLBACK)
-
-    if not settings.cloud_fast_mode:
-        fallback = nasdaq_fallback(state, settings.max_tickers)
-        for ticker in fallback:
-            tickers.append(ticker)
-            source_by_ticker.setdefault(ticker, "nasdaq_fallback")
-        debug["nasdaq_fallback"]["Fetched"] = max(int(debug["nasdaq_fallback"]["Fetched"]), len(fallback))
-
-    final_tickers = list(dict.fromkeys(tickers))[: settings.max_tickers]
-    debug_rows = [row for row in debug.values() if int(row["Fetched"]) > 0 or row["Source"] in {"day_gainers", "most_actives", "trending", "premarket_movers"}]
-    return final_tickers, debug_rows, source_by_ticker, source_message
-
-
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    return df
-
-
-def cached_download(
-    ticker: str,
-    state: AppState,
-    settings: ScannerSettings,
-    period: str,
-    interval: str,
-    prepost: bool,
-) -> pd.DataFrame:
-    key = f"{ticker}:{period}:{interval}:{prepost}"
-    now = time.monotonic()
-    cache = state.daily_cache if interval == "1d" else state.intraday_cache
-    ttl = 900 if interval == "1d" else settings.cache_seconds
-
-    with state.lock:
-        cached = cache.get(key)
-        if cached and now - cached[0] <= ttl:
-            return cached[1].copy()
-
-    try:
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            df = yf.download(
-                ticker,
-                period=period,
-                interval=interval,
-                prepost=prepost,
-                progress=False,
-                auto_adjust=False,
-                threads=False,
-                timeout=settings.request_timeout_seconds,
-            )
-    except Exception:
-        df = pd.DataFrame()
-
-    if df is None or df.empty or "Close" not in df:
-        df = pd.DataFrame()
+    if not merged:
+        merged = FALLBACK_RUNNERS.copy()
+        sources["Fallback runners"] = merged
+        message = "Fallback runner list active"
     else:
-        df = normalize_columns(df).dropna(subset=["Close"])
+        fallback_fill = [ticker for ticker in FALLBACK_RUNNERS if ticker not in merged]
+        merged.extend(fallback_fill[:30])
+        sources["Fallback runners"] = fallback_fill[:30]
+        message = "Live discovery active"
 
-    with state.lock:
-        cache[key] = (now, df.copy())
-        if len(cache) > 600:
-            cache.clear()
-    return df
-
-
-def session_rows(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    working = df.copy()
-    if working.index.tz is None:
-        working.index = working.index.tz_localize("UTC")
-    eastern = working.index.tz_convert("America/New_York")
-    working["session_date"] = eastern.date
-    today = working[working["session_date"] == working["session_date"].max()].copy()
-    regular = today.between_time("09:30", "16:00")
-    return today, regular
-
-
-def estimate_previous_close(ticker: str, current_price: float, open_price: float) -> tuple[float, str]:
-    quote = ACTIVE_QUOTE_CACHE.get(ticker, {})
-    previous_close = safe_float(quote.get("previous_close"), 0)
-    if previous_close > 0:
-        return previous_close, "confirmed previous close"
-    quote_price = safe_float(quote.get("price"), 0)
-    change_pct = safe_float(quote.get("change_pct"), np.nan)
-    if quote_price > 0 and not np.isnan(change_pct) and change_pct > -99:
-        return quote_price / (1 + change_pct / 100), "estimated from active source"
-    return open_price if open_price > 0 else current_price, "estimated previous close"
-
-
-def calc_vwap(df: pd.DataFrame) -> float:
-    if df.empty or "Volume" not in df or float(df["Volume"].sum()) <= 0:
-        return np.nan
-    typical = (df["High"] + df["Low"] + df["Close"]) / 3
-    return float((typical * df["Volume"]).sum() / df["Volume"].sum())
-
-
-def calc_relative_volume(volume: int, df: pd.DataFrame) -> float:
-    if df.empty or "Volume" not in df:
-        return 0.0
-    bars_seen = max(1, min(len(df), 78))
-    recent_bar_avg = float(df["Volume"].tail(20).mean())
-    baseline = recent_bar_avg * 78
-    if baseline <= 0:
-        return 0.0
-    projected = volume * 78 / bars_seen
-    return round(projected / baseline, 2)
-
-
-def calc_volume_acceleration(df: pd.DataFrame) -> float:
-    if df.empty or len(df) < 12 or "Volume" not in df:
-        return 0.0
-    last_two = float(df["Volume"].tail(2).mean())
-    previous_ten = float(df["Volume"].iloc[:-2].tail(10).mean())
-    return round(last_two / previous_ten, 2) if previous_ten > 0 else 0.0
-
-
-def last_two_candle_move(df: pd.DataFrame, current_price: float) -> float:
-    if df.empty or len(df) < 3 or current_price <= 0:
-        return 0.0
-    base = safe_float(df["Close"].iloc[-3], 0)
-    return ((current_price - base) / base) * 100 if base > 0 else 0.0
-
-
-def tight_consolidation(df: pd.DataFrame, current_price: float, day_high: float) -> tuple[float, bool]:
-    if df.empty or len(df) < 6 or current_price <= 0:
-        return 100.0, False
-    recent = df.tail(8)
-    range_pct = ((safe_float(recent["High"].max()) - safe_float(recent["Low"].min())) / current_price) * 100
-    near_high_pct = ((day_high - current_price) / current_price) * 100
-    return round(range_pct, 2), range_pct <= 4 and near_high_pct <= 3
-
-
-def higher_lows(df: pd.DataFrame) -> bool:
-    if df.empty or len(df) < 6:
-        return False
-    lows = df["Low"].tail(6).reset_index(drop=True)
-    return safe_float(lows.iloc[3:].min()) > safe_float(lows.iloc[:3].min()) and safe_float(lows.iloc[-1]) >= safe_float(lows.iloc[-3])
-
-
-def breakout_20d(ticker: str, current_price: float, state: AppState, settings: ScannerSettings) -> bool:
-    daily = cached_download(ticker, state, settings, "1mo", "1d", False)
-    if daily.empty or len(daily) < 10:
-        return False
-    prior = daily.iloc[:-1].tail(20) if len(daily) > 1 else daily.tail(20)
-    if prior.empty or "High" not in prior:
-        return False
-    return current_price >= safe_float(prior["High"].max(), current_price * 2)
-
-
-def explosion_score(gain_pct: float, rvol: float, accel: float, near_high_pct: float, volume: int) -> float:
-    score = 0.0
-    score += min(max(gain_pct, 0), 40) * 1.25
-    score += min(max(rvol, 0), 8) * 8
-    score += min(max(accel, 0), 8) * 7
-    score += max(0, 4 - near_high_pct) * 8
-    score += min(volume / 1_000_000, 10) * 2.5
-    return round(min(score, 100), 1)
-
-
-def premove_score(
-    is_tight: bool,
-    has_higher_lows: bool,
-    near_high_pct: float,
-    vwap_reclaim: bool,
-    volume_ignition: bool,
-    gap_pct: float,
-    breakout_20: bool,
-) -> float:
-    score = 0.0
-    score += 22 if is_tight else 0
-    score += 18 if has_higher_lows else 0
-    score += max(0, 3 - near_high_pct) * 10
-    score += 18 if vwap_reclaim else 0
-    score += 16 if volume_ignition else 0
-    score += min(max(gap_pct, 0), 12) * 1.2
-    score += 12 if breakout_20 else 0
-    return round(min(score, 100), 1)
-
-
-def discovery_candidate(ticker: str, settings: ScannerSettings) -> tuple[Optional[dict[str, object]], Optional[dict[str, object]], str]:
-    quote = ACTIVE_QUOTE_CACHE.get(ticker, {})
-    price = safe_float(quote.get("price"), 0)
-    gain_pct = safe_float(quote.get("change_pct"), 0)
-    volume = int(safe_float(quote.get("volume"), 0))
-    if price <= 0 or gain_pct < 20:
-        return None, None, "missing_data"
-    if price < settings.min_price or price > settings.max_price:
-        return None, None, "price_filter"
-
-    pullback_low = round_cent(price * 0.88)
-    pullback_high = round_cent(price * 0.95)
-    trigger = round_cent(price * 1.03)
-    stop = round_cent(max(0.01, pullback_low * 0.97))
-    risk = max(trigger - stop, 0)
-    target_1 = round_cent(trigger + risk * 2) if risk > 0 else round_cent(price * 1.12)
-    target_2 = round_cent(trigger + risk * 3) if risk > 0 else round_cent(price * 1.18)
-    score = explosion_score(gain_pct, 0.0, 0.0, 0.0, volume)
-    reasons = [f"market summary shows +{gain_pct:.2f}%"]
-    if gain_pct >= 80:
-        reasons.append("80%+ extreme runner")
-    elif gain_pct >= 40:
-        reasons.append("40%+ explosive gainer")
-    else:
-        reasons.append("20%+ explosive gainer")
-    if volume > 0:
-        reasons.append("public source volume available")
-
-    row = {
-        "Ticker": ticker,
-        "Mode": "EXPLOSIVE",
-        "Current Price": round(price, 4),
-        "Gain %": round(gain_pct, 2),
-        "Gap %": round(gain_pct, 2),
-        "Intraday Gain %": round(gain_pct, 2),
-        "Last 2 Candle Move %": np.nan,
-        "Volume": volume,
-        "RVOL": 0.0,
-        "Volume Acceleration": 0.0,
-        "Near High %": 0.0,
-        "VWAP Reclaim": False,
-        "Tight Consolidation": False,
-        "Higher Lows": False,
-        "20D Breakout": False,
-        "Score": score,
-        "Explosion Score": score,
-        "Pre-Move Score": 0.0,
-        "Status": "HOT RUNNER — WAIT FOR PULLBACK" if gain_pct > 30 else "BREAKOUT IMMINENT",
-        "Setup Type": "Explosive Runner Now",
-        "Trigger Entry": trigger,
-        "Pullback Zone": f"{pullback_low:.2f}-{pullback_high:.2f}",
-        "Stop": stop,
-        "Target 1": target_1,
-        "Target 2": target_2,
-        "Risk/Reward": "1:2.00" if risk > 0 else "N/A",
-        "Reason": ", ".join(reasons),
-        "Avoid Reason": "Discovery-only runner; wait for pullback, VWAP reclaim, or fresh intraday confirmation.",
-        "Data Quality": f"market summary discovery: {quote.get('discovery_source', 'public source')}",
-        "Last Updated": datetime.now().isoformat(timespec="seconds"),
-    }
-    return row, row.copy(), ""
-
-
-def analyze_ticker(ticker: str, state: AppState, settings: ScannerSettings) -> tuple[Optional[dict[str, object]], Optional[dict[str, object]], str]:
-    intraday = cached_download(ticker, state, settings, "1d", "5m", True)
-    if intraday.empty:
-        return discovery_candidate(ticker, settings)
-
-    today, regular = session_rows(intraday)
-    analysis = regular if not regular.empty else today
-    if today.empty or analysis.empty:
-        return None, None, "missing_data"
-
-    current_price = safe_float(today["Close"].iloc[-1])
-    open_price = safe_float(regular["Open"].iloc[0] if not regular.empty else today["Open"].iloc[0])
-    previous_close, data_quality = estimate_previous_close(ticker, current_price, open_price)
-    if current_price <= 0 or previous_close <= 0:
-        return None, None, "missing_data"
-    if current_price < settings.min_price or current_price > settings.max_price:
-        return None, None, "price_filter"
-
-    day_high = safe_float(today["High"].max(), current_price)
-    day_low = safe_float(today["Low"].min(), current_price)
-    volume = int(safe_float(today["Volume"].sum(), 0))
-    gap_pct = ((current_price - previous_close) / previous_close) * 100
-    intraday_gain_pct = ((current_price - open_price) / open_price) * 100 if open_price > 0 else 0.0
-    gain_pct = max(gap_pct, intraday_gain_pct)
-    last_2_move_pct = last_two_candle_move(analysis, current_price)
-    accel = calc_volume_acceleration(analysis)
-    rvol = calc_relative_volume(volume, analysis)
-    near_high_pct = ((day_high - current_price) / current_price) * 100 if current_price > 0 else 100.0
-    vwap = calc_vwap(analysis)
-    above_vwap = not np.isnan(vwap) and current_price >= vwap
-    vwap_reclaim = above_vwap and day_low <= vwap
-    compression_pct, is_tight = tight_consolidation(analysis, current_price, day_high)
-    has_higher_lows = higher_lows(analysis)
-    volume_ignition = accel >= 1.5
-
-    explosive_runner = gain_pct >= 20 or gap_pct >= 20 or last_2_move_pct >= 8 or accel >= 3
-    early_runner = gain_pct >= 5 and near_high_pct <= 5 and accel >= 1.5
-    pre_move_candidate = early_runner or (near_high_pct <= 3 and (is_tight or has_higher_lows or vwap_reclaim or accel >= 1.5))
-    if not explosive_runner and not pre_move_candidate:
-        watched = {
-            "Ticker": ticker,
-            "Price": current_price,
-            "Gain %": gain_pct,
-            "Volume": volume,
-            "RVOL": rvol,
-            "Near High %": near_high_pct,
-            "Reason": "watched active mover",
-        }
-        return None, watched, "no_setup"
-
-    breakout_20 = breakout_20d(ticker, current_price, state, settings) if (explosive_runner or pre_move_candidate) else False
-    exp_score = explosion_score(gain_pct, rvol, accel, near_high_pct, volume)
-    pre_score = premove_score(is_tight, has_higher_lows, near_high_pct, vwap_reclaim, volume_ignition, gap_pct, breakout_20)
-    mode = "EXPLOSIVE" if explosive_runner else "PREMOVE"
-    score = exp_score if explosive_runner else pre_score
-
-    support = round_cent(max(day_low, current_price * 0.965))
-    trigger = round_cent(max(day_high + 0.02, current_price * 1.006))
-    pullback_low = round_cent(max(support, current_price * 0.92 if explosive_runner else current_price * 0.965))
-    pullback_high = round_cent(max(pullback_low + 0.01, current_price * 0.97 if explosive_runner else current_price * 0.985))
-    stop = round_cent(max(0.01, min(support, pullback_low * 0.985)))
-    risk = max(trigger - stop, 0)
-    target_1 = round_cent(trigger + risk * 2) if risk > 0 else round_cent(current_price * 1.08)
-    target_2 = round_cent(trigger + risk * 3) if risk > 0 else round_cent(current_price * 1.14)
-    rr = (target_1 - trigger) / risk if risk > 0 else 0.0
-    trigger_distance_pct = abs(trigger - current_price) / current_price * 100 if current_price > 0 else 999
-    data_mismatch_pct = abs(current_price - safe_float(ACTIVE_QUOTE_CACHE.get(ticker, {}).get("price"), current_price)) / current_price * 100
-    below_open_and_vwap = current_price < open_price and (not np.isnan(vwap) and current_price < vwap)
-    extended_from_pullback = ((current_price - pullback_high) / pullback_high) * 100 if pullback_high > 0 else 999
-
-    reasons: list[str] = []
-    if explosive_runner:
-        if gain_pct >= 20:
-            reasons.append("20%+ momentum")
-        if gain_pct >= 40:
-            reasons.append("40%+ explosive gainer")
-        if gain_pct >= 80:
-            reasons.append("80%+ extreme runner")
-        if last_2_move_pct >= 8:
-            reasons.append("last 2 candles spike")
-        if accel >= 3:
-            reasons.append("volume acceleration >= 3x")
-    if pre_move_candidate:
-        if is_tight:
-            reasons.append("tight consolidation")
-        if has_higher_lows:
-            reasons.append("higher lows")
-        if vwap_reclaim:
-            reasons.append("VWAP reclaim")
-        if volume_ignition:
-            reasons.append("volume ignition starting")
-        if early_runner:
-            reasons.append("early runner pattern")
-    if near_high_pct <= 3:
-        reasons.append("near day high")
-    if gap_pct > 0:
-        reasons.append("gap up")
-    if breakout_20:
-        reasons.append("20-day breakout")
-
-    if data_mismatch_pct > 10:
-        status = "INVALID DATA"
-    elif below_open_and_vwap:
-        status = "WAIT FOR REVERSAL"
-    elif explosive_runner and gain_pct > 30:
-        status = "HOT RUNNER — WAIT FOR PULLBACK"
-    elif rvol < settings.min_rvol_for_valid:
-        status = "BREAKOUT IMMINENT" if explosive_runner else "PRE-MOVE WATCH"
-    elif trigger_distance_pct <= 3 and rr >= 2 and above_vwap and volume > settings.min_volume:
-        status = "VALID TRADE"
-    else:
-        status = "BREAKOUT IMMINENT" if explosive_runner else "PRE-MOVE WATCH"
-
-    if rvol < settings.min_rvol_for_valid and status == "VALID TRADE":
-        status = "BREAKOUT IMMINENT" if explosive_runner else "PRE-MOVE WATCH"
-
-    setup_type = "Explosive Runner Now" if explosive_runner else "Pre-Move Candidate"
-    avoid_reason = (
-        "Already extended; wait for pullback zone or clean VWAP reclaim."
-        if explosive_runner
-        else "Avoid if price loses VWAP/open, breaks higher-low structure, or volume fades."
+    tickers = dedupe(merged)[:max_tickers]
+    return DiscoveryResult(
+        tickers=tickers,
+        sources={name: len(dedupe(values)) for name, values in sources.items()},
+        message=message,
     )
-    if status == "INVALID DATA":
-        avoid_reason = "Data mismatch above 10%; wait for a fresh scan before planning a trade."
-    elif status == "WAIT FOR REVERSAL":
-        avoid_reason = "Price is below VWAP and open; wait for reclaim before any long setup."
-
-    row = {
-        "Ticker": ticker,
-        "Mode": mode,
-        "Current Price": round(current_price, 4),
-        "Gain %": round(gain_pct, 2),
-        "Gap %": round(gap_pct, 2),
-        "Intraday Gain %": round(intraday_gain_pct, 2),
-        "Last 2 Candle Move %": round(last_2_move_pct, 2),
-        "Volume": volume,
-        "RVOL": rvol,
-        "Volume Acceleration": accel,
-        "Near High %": round(near_high_pct, 2),
-        "VWAP Reclaim": vwap_reclaim,
-        "Tight Consolidation": is_tight,
-        "Higher Lows": has_higher_lows,
-        "20D Breakout": breakout_20,
-        "Score": score,
-        "Explosion Score": exp_score,
-        "Pre-Move Score": pre_score,
-        "Status": status,
-        "Setup Type": setup_type,
-        "Trigger Entry": trigger if status != "INVALID DATA" else None,
-        "Pullback Zone": f"{pullback_low:.2f}-{pullback_high:.2f}" if status != "INVALID DATA" else "N/A",
-        "Stop": stop if status != "INVALID DATA" else None,
-        "Target 1": target_1 if status != "INVALID DATA" else None,
-        "Target 2": target_2 if status != "INVALID DATA" else None,
-        "Risk/Reward": "N/A" if rr <= 0 or status == "INVALID DATA" else f"1:{rr:.2f}",
-        "Reason": ", ".join(reasons) if reasons else "active pressure detected",
-        "Avoid Reason": avoid_reason,
-        "Data Quality": data_quality,
-        "Last Updated": datetime.now().isoformat(timespec="seconds"),
-    }
-    return row, row.copy(), ""
 
 
-def split_and_rank(rows: list[dict[str, object]]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if not rows:
-        return pd.DataFrame(), pd.DataFrame()
-    df = pd.DataFrame(rows).drop_duplicates(subset=["Ticker"], keep="last")
-    status_rank = {
-        "VALID TRADE": 0,
-        "BREAKOUT IMMINENT": 1,
-        "PRE-MOVE WATCH": 2,
-        "HOT RUNNER — WAIT FOR PULLBACK": 3,
-        "WAIT FOR REVERSAL": 4,
-        "INVALID DATA": 5,
-    }
-    df["_status_rank"] = df["Status"].map(status_rank).fillna(9)
-    explosive = df[df["Mode"].eq("EXPLOSIVE")].sort_values(
-        ["Gain %", "Volume", "Near High %", "Volume Acceleration", "Explosion Score"],
-        ascending=[False, False, True, False, False],
+@st.cache_data(ttl=20, show_spinner=False)
+def quote_batch(symbols: tuple[str, ...], request_timeout: int) -> dict[str, dict[str, Any]]:
+    if not symbols:
+        return {}
+    payload = request_json(
+        YAHOO_QUOTE_URL,
+        params={"symbols": ",".join(symbols)},
+        timeout=request_timeout,
     )
-    premove = df[df["Mode"].eq("PREMOVE")].sort_values(["_status_rank", "Pre-Move Score", "RVOL"], ascending=[True, False, False])
-    return explosive.drop(columns=["_status_rank"]), premove.drop(columns=["_status_rank"])
+    quotes = payload.get("quoteResponse", {}).get("result", [])
+    return {quote.get("symbol"): quote for quote in quotes if quote.get("symbol")}
 
 
-def rank_watched(rows: list[dict[str, object]]) -> pd.DataFrame:
-    if not rows:
+@st.cache_data(ttl=20, show_spinner=False)
+def history_1d(symbol: str) -> pd.DataFrame:
+    frame = yf.download(
+        symbol,
+        period="1d",
+        interval="1m",
+        progress=False,
+        auto_adjust=False,
+        prepost=True,
+        threads=False,
+    )
+    if frame is None or frame.empty:
         return pd.DataFrame()
-    df = pd.DataFrame(rows).drop_duplicates(subset=["Ticker"], keep="last")
-    sort_cols = [col for col in ["Gain %", "RVOL", "Volume"] if col in df.columns]
-    return df.sort_values(sort_cols, ascending=[False] * len(sort_cols)).head(150) if sort_cols else df.head(150)
+    if isinstance(frame.columns, pd.MultiIndex):
+        frame.columns = [col[0] for col in frame.columns]
+    return frame.dropna(how="all")
 
 
-def update_source_debug(debug_rows: list[dict[str, object]], scanned: dict[str, int], passed: dict[str, int]) -> list[dict[str, object]]:
-    rows = [dict(row) for row in debug_rows]
-    known = {str(row["Source"]) for row in rows}
-    for source in set(scanned) | set(passed):
-        if source not in known:
-            rows.append({"Source": source, "Fetched": 0, "Scanned": 0, "Passed Filters": 0})
-    for row in rows:
-        source = str(row["Source"])
-        row["Scanned"] = int(scanned.get(source, 0))
-        row["Passed Filters"] = int(passed.get(source, 0))
-    return rows
+@st.cache_data(ttl=1800, show_spinner=False)
+def history_daily(symbol: str) -> pd.DataFrame:
+    frame = yf.download(
+        symbol,
+        period="30d",
+        interval="1d",
+        progress=False,
+        auto_adjust=False,
+        prepost=False,
+        threads=False,
+    )
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    if isinstance(frame.columns, pd.MultiIndex):
+        frame.columns = [col[0] for col in frame.columns]
+    return frame.dropna(how="all")
 
 
-def publish(
-    state: AppState,
-    candidate_rows: list[dict[str, object]],
-    watched_rows: list[dict[str, object]],
-    skip_counts: dict[str, int],
-    source_debug: list[dict[str, object]],
-    scanned_count: int,
-    started: float,
-    status_text: str,
-    timed_out: bool = False,
-    source_message: Optional[str] = None,
-) -> None:
-    explosive, premove = split_and_rank(candidate_rows)
-    watched = rank_watched(watched_rows)
-    with state.lock:
-        state.explosive_df = explosive
-        state.premove_df = premove
-        state.watched_df = watched
-        state.source_debug_df = pd.DataFrame(source_debug)
-        state.skip_counts = dict(skip_counts)
-        state.scanned_count = scanned_count
-        state.last_scan_seconds = time.monotonic() - started
-        state.status_text = status_text
-        state.timed_out = timed_out
-        state.source_message = source_message
+def latest_bar_age_seconds(frame: pd.DataFrame) -> float:
+    if frame.empty:
+        return float("inf")
+    index = frame.index[-1]
+    if getattr(index, "tzinfo", None) is None:
+        index = index.tz_localize("UTC")
+    else:
+        index = index.tz_convert("UTC")
+    return max(0.0, now_utc_ts() - index.timestamp())
 
 
-def scan_once(state: AppState, settings: ScannerSettings) -> None:
+def vwap(frame: pd.DataFrame) -> float:
+    if frame.empty:
+        return np.nan
+    typical = (frame["High"] + frame["Low"] + frame["Close"]) / 3
+    volume = frame["Volume"].replace(0, np.nan)
+    total_volume = safe_float(volume.sum(), 0)
+    if total_volume <= 0:
+        return np.nan
+    return safe_float((typical * volume).sum() / total_volume, np.nan)
+
+
+def rolling_base_low(frame: pd.DataFrame) -> float:
+    if frame.empty:
+        return np.nan
+    lookback = frame.tail(min(45, len(frame)))
+    return safe_float(lookback["Low"].min(), np.nan)
+
+
+def volume_acceleration(frame: pd.DataFrame) -> float:
+    if len(frame) < 8:
+        return np.nan
+    recent = frame["Volume"].tail(5).mean()
+    prior = frame["Volume"].iloc[:-5].tail(20).mean()
+    if prior <= 0 or np.isnan(prior):
+        return np.nan
+    return safe_float(recent / prior, np.nan)
+
+
+def relative_volume(frame: pd.DataFrame, daily: pd.DataFrame) -> float:
+    current_volume = safe_float(frame["Volume"].sum(), np.nan) if not frame.empty else np.nan
+    if daily.empty or np.isnan(current_volume):
+        return np.nan
+    avg_daily_volume = safe_float(daily["Volume"].tail(20).mean(), np.nan)
+    if avg_daily_volume <= 0 or np.isnan(avg_daily_volume):
+        return np.nan
+    market_minutes = 390
+    elapsed = min(max(len(frame), 1), market_minutes)
+    expected = avg_daily_volume * (elapsed / market_minutes)
+    return safe_float(current_volume / expected, np.nan) if expected > 0 else np.nan
+
+
+def invalid_row(symbol: str, reason: str = "Invalid data") -> dict[str, Any]:
+    return {
+        "ticker": symbol,
+        "setup": "INVALID DATA",
+        "mode": "Watched Movers",
+        "trade_status": "Invalid",
+        "score": 0.0,
+        "current": np.nan,
+        "previous_close": np.nan,
+        "open": np.nan,
+        "day_high": np.nan,
+        "day_low": np.nan,
+        "nhod_level": np.nan,
+        "breakout_level": np.nan,
+        "dip_low": np.nan,
+        "dip_high": np.nan,
+        "vwap": np.nan,
+        "support": np.nan,
+        "stop": np.nan,
+        "target_1": np.nan,
+        "target_2": np.nan,
+        "rr": np.nan,
+        "extension_from_base": np.nan,
+        "vol_accel": np.nan,
+        "rvol": np.nan,
+        "near_high_pct": np.nan,
+        "gap_pct": np.nan,
+        "gain_pct": np.nan,
+        "volume": 0,
+        "stale_seconds": float("inf"),
+        "mismatch_pct": np.nan,
+        "valid_trade": False,
+        "source_price": np.nan,
+        "last_updated": utc_clock(now_utc_ts()),
+        "reason": reason,
+    }
+
+
+def normalize_scan_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    defaults = invalid_row("")
+    for column, default in defaults.items():
+        if column not in frame:
+            frame[column] = default
+    frame["valid_trade"] = frame["valid_trade"].fillna(False).astype(bool)
+    return frame
+
+
+def compute_levels(symbol: str, quote: dict[str, Any], config: ScanConfig) -> dict[str, Any]:
+    intraday = history_1d(symbol)
+    daily = history_daily(symbol)
+
+    if intraday.empty:
+        return invalid_row(symbol, "No intraday data")
+
+    current = safe_float(intraday["Close"].iloc[-1], np.nan)
+    quote_price = safe_float(quote.get("regularMarketPrice") or quote.get("preMarketPrice"), np.nan)
+    if not np.isnan(quote_price) and quote_price > 0:
+        mismatch = abs(current - quote_price) / quote_price
+    else:
+        mismatch = 0.0
+
+    previous_close = safe_float(
+        quote.get("regularMarketPreviousClose")
+        or (daily["Close"].iloc[-2] if len(daily) > 1 else np.nan),
+        np.nan,
+    )
+    open_price = safe_float(intraday["Open"].iloc[0], np.nan)
+    day_high = safe_float(intraday["High"].max(), np.nan)
+    day_low = safe_float(intraday["Low"].min(), np.nan)
+    day_volume = safe_int(intraday["Volume"].sum(), 0)
+    vw = vwap(intraday)
+    base_low = rolling_base_low(intraday)
+
+    gain_pct = ((current - previous_close) / previous_close * 100) if previous_close > 0 else np.nan
+    gap_pct = ((open_price - previous_close) / previous_close * 100) if previous_close > 0 else np.nan
+    near_high_pct = ((day_high - current) / day_high * 100) if day_high > 0 else np.nan
+    extension_from_base = ((current - base_low) / base_low * 100) if base_low > 0 else np.nan
+    vol_accel = volume_acceleration(intraday)
+    rvol = relative_volume(intraday, daily)
+    stale_seconds = latest_bar_age_seconds(intraday)
+
+    recent_high = safe_float(intraday["High"].tail(min(20, len(intraday))).max(), day_high)
+    recent_low = safe_float(intraday["Low"].tail(min(20, len(intraday))).min(), day_low)
+    breakout_level = round(max(recent_high, day_high) * 1.002, 4)
+    nhod_level = round(day_high * 1.001, 4)
+    support = round(max(day_low, min(vw if not np.isnan(vw) else day_low, recent_low)), 4)
+    dip_low = round(max(support, vw * 0.985 if not np.isnan(vw) else support), 4)
+    dip_high = round(max(dip_low, vw * 1.01 if not np.isnan(vw) else recent_low), 4)
+
+    stop = round(min(dip_low, support) * 0.985, 4)
+    if stop >= current:
+        stop = round(current * 0.97, 4)
+    risk = max(current - stop, 0)
+    target_1 = round(current + risk * 2, 4) if risk > 0 else np.nan
+    target_2 = round(current + risk * 3, 4) if risk > 0 else np.nan
+    rr = ((target_1 - current) / risk) if risk > 0 else np.nan
+
+    above_vwap = bool(current >= vw) if not np.isnan(vw) else False
+    near_trigger = not np.isnan(near_high_pct) and near_high_pct <= 3.5
+    inside_dip_zone = dip_low <= current <= dip_high if all(not np.isnan(x) for x in [dip_low, dip_high]) else False
+    active_volume = (
+        day_volume >= config.min_volume
+        and (safe_float(rvol, 0) >= 1.2 or safe_float(vol_accel, 0) >= 1.3)
+    )
+    reclaiming_support = current >= support and current >= open_price * 0.995
+    latest_not_stale = stale_seconds <= 20 * 60
+    risk_ok = safe_float(rr, 0) >= 2.0 and risk > 0
+    valid_trade = (near_trigger or inside_dip_zone) and risk_ok and latest_not_stale and (above_vwap or reclaiming_support) and active_volume
+
+    tight_range = ((day_high - day_low) / current * 100) if current > 0 else np.nan
+    recent_closes = intraday["Close"].tail(min(12, len(intraday)))
+    higher_lows = len(intraday) >= 12 and bool(intraday["Low"].tail(12).iloc[-1] > intraday["Low"].tail(12).min())
+    volume_ignition = safe_float(vol_accel, 0) >= 1.5 or safe_float(rvol, 0) >= 1.5
+    lower_wick_bounce = bool(intraday["Close"].iloc[-1] > intraday["Open"].iloc[-1] and intraday["Low"].iloc[-1] <= dip_high)
+    consolidation = safe_float(tight_range, 99) <= 9 and safe_float(near_high_pct, 99) <= 6
+    resistance_nearby = current >= day_high * 0.985 if day_high > 0 else False
+
+    if (
+        np.isnan(current)
+        or current <= 0
+        or current < config.min_price
+        or current > config.max_price
+        or mismatch > 0.10
+        or np.isnan(previous_close)
+    ):
+        setup = "INVALID DATA"
+        mode = "Watched Movers"
+        trade_status = "Invalid"
+    elif safe_float(gain_pct, 0) > 30 and safe_float(extension_from_base, 0) > 18 and current > dip_high * 1.05:
+        setup = "WAIT FOR PULLBACK"
+        mode = "Watched Movers"
+        trade_status = "Wait"
+    elif current < vw and current < open_price:
+        setup = "WAIT FOR REVERSAL"
+        mode = "Watched Movers"
+        trade_status = "Wait"
+    elif valid_trade and safe_float(gain_pct, 0) >= 10 and near_trigger and safe_float(vol_accel, 0) >= 1.4:
+        setup = "NHOD MOMENTUM" if current >= day_high * 0.995 else "MOMENTUM TRIGGER"
+        mode = "Explosive Runners Now"
+        trade_status = "Valid trade"
+    elif valid_trade and inside_dip_zone and lower_wick_bounce:
+        setup = "DIP BUY ZONE"
+        mode = "Dip Buy Zones"
+        trade_status = "Valid trade"
+    elif valid_trade and consolidation and higher_lows and volume_ignition:
+        setup = "BREAKOUT WATCH"
+        mode = "Breakout Watch"
+        trade_status = "Valid trade"
+    elif resistance_nearby and (safe_float(rvol, 0) < 1.2 or safe_float(tight_range, 99) < 5):
+        setup = "SCALP ONLY"
+        mode = "Watched Movers"
+        trade_status = "Scalp only"
+    elif safe_float(gain_pct, 0) >= 10 and near_trigger and active_volume:
+        setup = "BREAKOUT WATCH"
+        mode = "Breakout Watch"
+        trade_status = "Watch"
+    elif inside_dip_zone and current >= support:
+        setup = "DIP BUY ZONE"
+        mode = "Dip Buy Zones"
+        trade_status = "Watch"
+    elif safe_float(gain_pct, 0) >= 15 and not near_trigger:
+        setup = "WAIT FOR PULLBACK"
+        mode = "Watched Movers"
+        trade_status = "Wait"
+    else:
+        setup = "SCALP ONLY" if active_volume else "TOO LATE / AVOID"
+        mode = "Watched Movers"
+        trade_status = "Caution"
+
+    score = 0
+    score += min(max(safe_float(gain_pct, 0), 0), 30)
+    score += min(max(safe_float(rvol, 0) * 8, 0), 25)
+    score += min(max(safe_float(vol_accel, 0) * 8, 0), 20)
+    score += max(0, 15 - min(max(safe_float(near_high_pct, 15), 0), 15))
+    score += 10 if valid_trade else 0
+
+    return {
+        "ticker": symbol,
+        "setup": setup,
+        "mode": mode,
+        "trade_status": trade_status,
+        "score": round(score, 1),
+        "current": current,
+        "previous_close": previous_close,
+        "open": open_price,
+        "day_high": day_high,
+        "day_low": day_low,
+        "nhod_level": nhod_level,
+        "breakout_level": breakout_level,
+        "dip_low": dip_low,
+        "dip_high": dip_high,
+        "vwap": vw,
+        "support": support,
+        "stop": stop,
+        "target_1": target_1,
+        "target_2": target_2,
+        "rr": rr,
+        "extension_from_base": extension_from_base,
+        "vol_accel": vol_accel,
+        "rvol": rvol,
+        "near_high_pct": near_high_pct,
+        "gap_pct": gap_pct,
+        "gain_pct": gain_pct,
+        "volume": day_volume,
+        "stale_seconds": stale_seconds,
+        "mismatch_pct": mismatch * 100,
+        "valid_trade": valid_trade,
+        "source_price": quote_price,
+        "last_updated": utc_clock(now_utc_ts()),
+    }
+
+
+def plan_comments(row: pd.Series, lang: str) -> dict[str, str]:
+    b = fmt_money(row["breakout_level"])
+    d1 = fmt_money(row["dip_low"])
+    d2 = fmt_money(row["dip_high"])
+    stop = fmt_money(row["stop"])
+    current = fmt_money(row["current"])
+    v = fmt_money(row["vwap"])
+
+    if is_arabic(lang):
+        return {
+            "confirmation": f"اختراق مستوى {b} مع حجم تداول قوي قد يفعّل استمرار الحركة.",
+            "invalidation": f"الإلغاء إذا كسر السعر {stop} أو فقد VWAP عند {v}.",
+            "why": f"السعر الحالي {current} قريب من الزخم، والحجم النسبي {fmt_x(row['rvol'])} مع تسارع حجم {fmt_x(row['vol_accel'])}.",
+            "avoid": f"إذا رفض السعر مستوى {b}، تجنب المطاردة. السهم ممتد؛ انتظر رجوع نظيف عند الحاجة.",
+            "dip": f"منطقة الشراء على النزول بين {d1} و {d2}، ووقف الخسارة تحت {stop}.",
+        }
+    return {
+        "confirmation": f"Break above {b} with volume can trigger continuation.",
+        "invalidation": f"Invalid if price loses {stop} or fails VWAP near {v}.",
+        "why": f"Current price {current} is near the active level with {fmt_x(row['rvol'])} RVOL and {fmt_x(row['vol_accel'])} volume acceleration.",
+        "avoid": f"If it rejects {b}, avoid chasing. Already extended names need a clean pullback.",
+        "dip": f"Dip zone is {d1}-{d2}; stop under {stop}.",
+    }
+
+
+def scan_universe(tickers: list[str], config: ScanConfig, progress=None) -> pd.DataFrame:
     started = time.monotonic()
-    deadline = started + settings.scan_timeout_seconds
-    tickers, source_debug, source_by_ticker, source_message = build_universe(state, settings)
-    candidate_rows: list[dict[str, object]] = []
-    watched_rows: list[dict[str, object]] = []
-    skip_counts = {key: 0 for key in SKIP_KEYS}
-    scanned_by_source: dict[str, int] = {}
-    passed_by_source: dict[str, int] = {}
+    deadline = started + config.scan_timeout
+    rows: list[dict[str, Any]] = []
     scanned = 0
 
-    with state.lock:
-        state.last_scan_started = datetime.now().isoformat(timespec="seconds")
-        state.status_text = f"Scanning {len(tickers)} active small-cap candidates..."
-        state.error = None
-        state.timed_out = False
-        state.source_message = source_message
+    quotes: dict[str, dict[str, Any]] = {}
+    for i in range(0, len(tickers), 50):
+        batch = tuple(tickers[i : i + 50])
+        try:
+            quotes.update(quote_batch(batch, config.request_timeout))
+        except Exception:
+            continue
 
-    executor = ThreadPoolExecutor(max_workers=max(1, min(settings.max_workers, 12)))
+    executor = ThreadPoolExecutor(max_workers=config.workers)
+    futures = {
+        executor.submit(compute_levels, ticker, quotes.get(ticker, {}), config): ticker
+        for ticker in tickers
+    }
+    pending = set(futures)
     try:
-        pending = {executor.submit(analyze_ticker, ticker, state, settings): ticker for ticker in tickers}
-        while pending and not state.stop_event.is_set():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            done, pending_set = wait(set(pending), timeout=min(0.5, remaining), return_when=FIRST_COMPLETED)
+        while pending and time.monotonic() < deadline:
+            done, pending = wait(
+                pending,
+                timeout=0.5,
+                return_when=FIRST_COMPLETED,
+            )
             if not done:
                 continue
             for future in done:
-                ticker = pending.pop(future, "")
-                source = source_by_ticker.get(ticker, "runner_fallback")
+                if time.monotonic() > deadline:
+                    break
                 scanned += 1
-                scanned_by_source[source] = scanned_by_source.get(source, 0) + 1
                 try:
-                    candidate, watched, skip_reason = future.result(timeout=0)
-                except Exception:
-                    candidate, watched, skip_reason = None, None, "missing_data"
-                if watched is not None:
-                    watched["Source"] = source
-                    watched_rows.append(watched)
-                if candidate is not None:
-                    candidate["Source"] = source
-                    candidate_rows.append(candidate)
-                    passed_by_source[source] = passed_by_source.get(source, 0) + 1
-                elif skip_reason in skip_counts:
-                    skip_counts[skip_reason] += 1
-                debug = update_source_debug(source_debug, scanned_by_source, passed_by_source)
-                publish(state, candidate_rows, watched_rows, skip_counts, debug, scanned, started, f"Scanning: {scanned}/{len(tickers)} complete", source_message=source_message)
-            pending = {future: pending[future] for future in pending_set}
-        timed_out = bool(pending)
+                    row = future.result(timeout=0)
+                except Exception as exc:
+                    row = invalid_row(futures[future], str(exc)[:100])
+                rows.append(row)
+                if progress is not None:
+                    progress.progress(min(scanned / max(len(tickers), 1), 1.0))
+    finally:
         for future in pending:
             future.cancel()
-    finally:
         executor.shutdown(wait=False, cancel_futures=True)
 
-    debug = update_source_debug(source_debug, scanned_by_source, passed_by_source)
-    status = "Scan timeout reached; showing partial results." if timed_out else "Scan complete."
-    publish(state, candidate_rows, watched_rows, skip_counts, debug, scanned, started, status, timed_out, source_message)
-    with state.lock:
-        state.last_scan_finished = datetime.now().isoformat(timespec="seconds")
-        state.cycle_count += 1
+    if not rows:
+        return pd.DataFrame()
+
+    frame = pd.DataFrame(rows)
+    frame = normalize_scan_frame(frame)
+    for column in ["score", "gain_pct", "rvol", "vol_accel", "near_high_pct", "rr", "volume"]:
+        if column not in frame:
+            frame[column] = np.nan
+    frame = frame.sort_values(
+        by=["valid_trade", "score", "gain_pct", "rvol"],
+        ascending=[False, False, False, False],
+        na_position="last",
+    )
+    return frame.reset_index(drop=True)
 
 
-def scanner_loop(state: AppState) -> None:
-    while not state.stop_event.is_set():
-        with state.lock:
-            settings = state.settings
-        try:
-            scan_once(state, settings)
-        except Exception as exc:
-            with state.lock:
-                state.error = f"{type(exc).__name__}: {exc}"
-                state.status_text = "Scanner error."
-        sleep_until = time.monotonic() + max(5, settings.scan_interval_seconds)
-        while time.monotonic() < sleep_until and not state.stop_event.is_set():
-            time.sleep(0.25)
-
-
-def restart_scanner(state: AppState, settings: ScannerSettings, clear_cache: bool = False) -> None:
-    with state.lock:
-        old_thread = state.scanner_thread
-        state.stop_event.set()
-    if old_thread and old_thread.is_alive():
-        old_thread.join(timeout=1.5)
-    with state.lock:
-        state.version = APP_VERSION
-        state.stop_event = threading.Event()
-        state.settings = settings
-        state.explosive_df = pd.DataFrame()
-        state.premove_df = pd.DataFrame()
-        state.watched_df = pd.DataFrame()
-        state.source_debug_df = pd.DataFrame()
-        state.skip_counts = {key: 0 for key in SKIP_KEYS}
-        state.scanned_count = 0
-        state.last_scan_seconds = 0.0
-        state.timed_out = False
-        state.source_message = None
-        state.error = None
-        state.status_text = "Restarting scanner..."
-        if clear_cache:
-            state.intraday_cache = {}
-            state.daily_cache = {}
-            state.universe_cache = None
-        thread = threading.Thread(target=scanner_loop, args=(state,), daemon=True, name="explosive-runner-scanner")
-        state.scanner_thread = thread
-        thread.start()
-
-
-def ensure_scanner(state: AppState) -> None:
-    with state.lock:
-        stale = state.version != APP_VERSION
-        alive = bool(state.scanner_thread and state.scanner_thread.is_alive())
-        settings = state.settings
-    if stale:
-        restart_scanner(state, ScannerSettings(), clear_cache=True)
-    elif not alive:
-        restart_scanner(state, settings)
-
-
-def snapshot(state: AppState) -> dict[str, object]:
-    with state.lock:
-        return {
-            "settings": state.settings,
-            "explosive": state.explosive_df.copy(),
-            "premove": state.premove_df.copy(),
-            "watched": state.watched_df.copy(),
-            "source_debug": state.source_debug_df.copy(),
-            "skip_counts": dict(state.skip_counts),
-            "cycle": state.cycle_count,
-            "scanned": state.scanned_count,
-            "last_scan_seconds": state.last_scan_seconds,
-            "last_scan_started": state.last_scan_started,
-            "last_scan_finished": state.last_scan_finished,
-            "timed_out": state.timed_out,
-            "status_text": state.status_text,
-            "source_message": state.source_message,
-            "error": state.error,
-            "thread_alive": bool(state.scanner_thread and state.scanner_thread.is_alive()),
-        }
-
-
-def apply_theme() -> None:
+def inject_theme(lang: str) -> None:
+    direction = "rtl" if is_arabic(lang) else "ltr"
+    align = "right" if is_arabic(lang) else "left"
     st.markdown(
-        """
+        f"""
         <style>
-            :root {
-                --panel: #0d1422;
-                --panel-2: #111a2b;
-                --line: #223047;
-                --muted: #94a3b8;
-                --text: #e5e7eb;
-            }
-            .stApp {
-                background:
-                    radial-gradient(circle at 20% 0%, rgba(239, 68, 68, 0.08), transparent 28rem),
-                    linear-gradient(180deg, #060a11 0%, #0a101b 100%);
-                color: var(--text);
-            }
-            [data-testid="stSidebar"] {
-                background: #09111f;
-                border-right: 1px solid #1f2937;
-            }
-            .block-container {
-                padding-top: 1.2rem;
-                padding-bottom: 2rem;
-                max-width: 1760px;
-            }
-            h1, h2, h3 {
-                color: #f8fafc;
-                letter-spacing: 0;
-            }
-            h1 { font-size: clamp(1.7rem, 3vw, 2.6rem); }
-            div[data-testid="stMetric"] {
-                background: linear-gradient(180deg, var(--panel-2) 0%, var(--panel) 100%);
-                border: 1px solid var(--line);
-                border-radius: 16px;
-                padding: 0.85rem;
-                box-shadow: 0 14px 34px rgba(0, 0, 0, 0.22);
-                min-height: 82px;
-            }
-            div[data-testid="stDataFrame"] {
-                border: 1px solid var(--line);
-                border-radius: 16px;
-                overflow: hidden;
-                box-shadow: 0 12px 30px rgba(0, 0, 0, 0.22);
-            }
-            div[data-testid="stVerticalBlockBorderWrapper"] {
-                border-radius: 16px;
-                border-color: var(--line);
-                background: linear-gradient(180deg, rgba(17, 26, 43, 0.96), rgba(11, 18, 32, 0.96));
-                box-shadow: 0 18px 42px rgba(0, 0, 0, 0.25);
-            }
-            div[data-testid="stVerticalBlockBorderWrapper"] > div {
-                min-height: 340px;
-            }
-            .stButton button {
-                border-radius: 16px;
-                border: 1px solid #334155;
-            }
-            [data-testid="stDataFrame"] div,
-            [data-testid="stDataFrame"] span {
-                white-space: nowrap;
-            }
-            @media (max-width: 760px) {
-                .block-container {
-                    padding-left: 0.9rem;
-                    padding-right: 0.9rem;
-                }
-                div[data-testid="stVerticalBlockBorderWrapper"] > div {
-                    min-height: auto;
-                }
-                div[data-testid="stDataFrame"] {
-                    display: none;
-                }
-            }
+        :root {{
+            color-scheme: dark;
+        }}
+        .stApp {{
+            background:
+                radial-gradient(circle at top left, rgba(19, 92, 92, .24), transparent 30rem),
+                linear-gradient(135deg, #08100f 0%, #0b1118 52%, #10130f 100%);
+            color: #f2f7f4;
+            direction: {direction};
+        }}
+        .block-container {{
+            max-width: 1280px;
+            padding-top: 1.4rem;
+            padding-bottom: 2rem;
+        }}
+        h1, h2, h3, p, label, div[data-testid="stMarkdownContainer"] {{
+            text-align: {align};
+        }}
+        div[data-testid="stMetric"] {{
+            background: rgba(255, 255, 255, .055);
+            border: 1px solid rgba(255, 255, 255, .10);
+            border-radius: 8px;
+            padding: .85rem 1rem;
+        }}
+        div[data-testid="stMetricLabel"] p {{
+            color: #aebbb5;
+        }}
+        div[data-testid="stMetricValue"] {{
+            color: #f4fff9;
+        }}
+        section[data-testid="stSidebar"] {{
+            background: #09100f;
+        }}
+        .stButton button {{
+            border-radius: 8px;
+            border: 1px solid rgba(64, 224, 171, .35);
+            background: #123c34;
+            color: #effff8;
+            min-height: 2.5rem;
+        }}
+        div[data-testid="stDataFrame"] {{
+            border: 1px solid rgba(255, 255, 255, .08);
+            border-radius: 8px;
+            overflow: hidden;
+        }}
         </style>
         """,
         unsafe_allow_html=True,
     )
 
 
-def render_runner_card(row: pd.Series) -> None:
+def render_plan_card(row: pd.Series, lang: str) -> None:
+    comments = plan_comments(row, lang)
+    setup = setup_text(str(row["setup"]), lang)
+    status_color = "green" if bool(row.get("valid_trade", False)) else "orange"
+    if row["setup"] in {"INVALID DATA", "TOO LATE / AVOID"}:
+        status_color = "red"
+
     with st.container(border=True):
-        header = st.columns([0.52, 0.48], vertical_alignment="center")
-        header[0].markdown(f"### {row.get('Ticker', 'N/A')}")
-        header[1].markdown(status_badge_text(str(row.get("Status", "WATCH"))))
-        score = row.get("Explosion Score") if row.get("Mode") == "EXPLOSIVE" else row.get("Pre-Move Score")
-        st.progress(min(max(safe_float(score, 0) / 100, 0), 1), text=f"Score {fmt_score(score)}")
-        grid_top = st.columns(2)
-        grid_top[0].metric("Price", fmt_currency(row.get("Current Price")))
-        grid_top[1].metric("Trigger", fmt_currency(row.get("Trigger Entry")))
-        grid_bottom = st.columns(2)
-        grid_bottom[0].metric("Pullback", str(row.get("Pullback Zone", "N/A")))
-        grid_bottom[1].metric("Target", fmt_currency(row.get("Target 1")))
-        st.caption(str(row.get("Reason", "")))
-        st.caption(f"Avoid: {row.get('Avoid Reason', '')}")
+        top_left, top_right = st.columns([1.2, 1])
+        with top_left:
+            st.subheader(f"{row['ticker']} · {setup}")
+            st.caption(f"{tr('mode', lang)}: {tr(mode_key(str(row['mode'])), lang)}")
+        with top_right:
+            st.markdown(f":{status_color}[{row['trade_status']}]")
+
+        metric_cols = st.columns(4)
+        metric_cols[0].metric(tr("current", lang), fmt_money(row["current"]), fmt_pct(row["gain_pct"]))
+        metric_cols[1].metric(tr("break", lang), fmt_money(row["breakout_level"]), tr("near_high", lang) + " " + fmt_pct(row["near_high_pct"]))
+        metric_cols[2].metric(tr("stop", lang), fmt_money(row["stop"]), tr("rr", lang) + " " + fmt_rr(row["rr"]))
+        metric_cols[3].metric(tr("rvol", lang), fmt_x(row["rvol"]), tr("vol_acc", lang) + " " + fmt_x(row["vol_accel"]))
+
+        info = {
+            tr("ticker", lang): row["ticker"],
+            tr("setup", lang): setup,
+            tr("current", lang): fmt_money(row["current"]),
+            tr("break", lang): fmt_money(row["breakout_level"]),
+            tr("dip_zone", lang): f"{fmt_money(row['dip_low'])} - {fmt_money(row['dip_high'])}",
+            tr("stop", lang): fmt_money(row["stop"]),
+            tr("target1", lang): fmt_money(row["target_1"]),
+            tr("target2", lang): fmt_money(row["target_2"]),
+            tr("rr", lang): fmt_rr(row["rr"]),
+        }
+        st.dataframe(pd.DataFrame([info]), use_container_width=True, hide_index=True)
+
+        st.write(f"**{tr('confirmation', lang)}**")
+        st.write(comments["confirmation"])
+        st.write(f"**{tr('invalidation', lang)}**")
+        st.write(comments["invalidation"])
+        st.write(f"**{tr('why', lang)}**")
+        st.write(comments["why"])
+        st.write(f"**{tr('avoid', lang)}**")
+        st.write(comments["avoid"])
+
+        with st.expander(tr("details", lang)):
+            detail = pd.DataFrame(
+                [
+                    {
+                        "Open": fmt_money(row["open"]),
+                        "Day high": fmt_money(row["day_high"]),
+                        "Day low": fmt_money(row["day_low"]),
+                        "NHOD": fmt_money(row["nhod_level"]),
+                        "VWAP": fmt_money(row["vwap"]),
+                        "Support": fmt_money(row["support"]),
+                        "Extension": fmt_pct(row["extension_from_base"]),
+                        "Gap": fmt_pct(row["gap_pct"]),
+                        "Volume": f"{safe_int(row['volume']):,}",
+                        "Data age": f"{safe_float(row['stale_seconds'], 0) / 60:.1f} min",
+                    }
+                ]
+            )
+            st.dataframe(detail, use_container_width=True, hide_index=True)
 
 
-def compact_table(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
+def mode_key(mode: str) -> str:
+    return {
+        "Explosive Runners Now": "explosive",
+        "Breakout Watch": "breakout",
+        "Dip Buy Zones": "dip",
+        "Watched Movers": "watched",
+    }.get(mode, "watched")
+
+
+def section_filter(frame: pd.DataFrame, section: str) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    if section == "Explosive Runners Now":
+        return frame[frame["mode"].eq(section)].head(5)
+    if section == "Breakout Watch":
+        return frame[frame["setup"].isin(["BREAKOUT WATCH", "MOMENTUM TRIGGER", "NHOD MOMENTUM"])].head(5)
+    if section == "Dip Buy Zones":
+        return frame[frame["setup"].eq("DIP BUY ZONE")].head(5)
+    return frame[~frame["mode"].isin(["Explosive Runners Now", "Dip Buy Zones"])].head(5)
+
+
+def compact_table(frame: pd.DataFrame, lang: str) -> pd.DataFrame:
+    if frame.empty:
         return pd.DataFrame()
-    rows: list[dict[str, object]] = []
-    for _, row in df.iterrows():
+    rows = []
+    for _, row in frame.iterrows():
         rows.append(
             {
-                "Ticker": row.get("Ticker", ""),
-                "Status": row.get("Status", ""),
-                "Score": fmt_score(row.get("Score")),
-                "Price": fmt_currency(row.get("Current Price")),
-                "Gain": fmt_pct(row.get("Gain %")),
-                "RVOL": fmt_rvol(row.get("RVOL")),
-                "Trigger": fmt_currency(row.get("Trigger Entry")),
-                "Pullback": row.get("Pullback Zone", "N/A"),
-                "Stop": fmt_currency(row.get("Stop")),
-                "Target 1": fmt_currency(row.get("Target 1")),
-                "Reason": row.get("Reason", ""),
+                tr("ticker", lang): row["ticker"],
+                tr("setup", lang): setup_text(str(row["setup"]), lang),
+                tr("price", lang): fmt_money(row["current"]),
+                tr("gain", lang): fmt_pct(row["gain_pct"]),
+                tr("rvol", lang): fmt_x(row["rvol"]),
+                tr("near_high", lang): fmt_pct(row["near_high_pct"]),
+                tr("rr", lang): fmt_rr(row["rr"]),
+                tr("status", lang): row["trade_status"],
             }
         )
     return pd.DataFrame(rows)
 
 
-def render_section(title: str, df: pd.DataFrame, empty_text: str) -> None:
-    st.subheader(title)
-    if df.empty:
-        st.info(empty_text)
+def render_section(frame: pd.DataFrame, title_key: str, source_mode: str, lang: str, max_cards: int) -> None:
+    st.header(tr(title_key, lang))
+    subset = section_filter(frame, source_mode).head(max_cards)
+    if subset.empty:
+        st.info(tr("no_results", lang))
         return
-    cards = df.head(3)
-    cols = st.columns(min(3, len(cards)), gap="large")
-    for index, (_, row) in enumerate(cards.iterrows()):
-        with cols[index % len(cols)]:
-            render_runner_card(row)
-    st.dataframe(compact_table(df), use_container_width=True, hide_index=True)
+    st.dataframe(compact_table(subset, lang), use_container_width=True, hide_index=True)
+    for _, row in subset.iterrows():
+        render_plan_card(row, lang)
 
 
-def render_dashboard(snap: dict[str, object]) -> None:
-    explosive: pd.DataFrame = snap["explosive"]  # type: ignore[assignment]
-    premove: pd.DataFrame = snap["premove"]  # type: ignore[assignment]
-    watched: pd.DataFrame = snap["watched"]  # type: ignore[assignment]
-    source_debug: pd.DataFrame = snap["source_debug"]  # type: ignore[assignment]
-    skip_counts: dict[str, int] = snap["skip_counts"]  # type: ignore[assignment]
+def initialize_state() -> None:
+    defaults = {
+        "scan_df": pd.DataFrame(),
+        "last_scan_ts": None,
+        "source_counts": {},
+        "discovery_message": "",
+        "optional_watchlist": "",
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
-    total_candidates = len(explosive) + len(premove)
-    metrics = st.columns(5)
-    metrics[0].metric("Scanner", "RUNNING" if snap["thread_alive"] else "STOPPED")
-    metrics[1].metric("Cycle", f"{int(snap['cycle']):,}")
-    metrics[2].metric("Scanned", f"{int(snap['scanned']):,}")
-    metrics[3].metric("Setups", f"{total_candidates:,}")
-    metrics[4].metric("Last Scan", f"{safe_float(snap['last_scan_seconds'], 0):.1f}s")
 
-    st.caption(
-        f"{snap['status_text']} | Last updated: {datetime.now().isoformat(timespec='seconds')} | "
-        f"Last finished: {snap['last_scan_finished'] or 'Waiting...'}"
-    )
-    if snap["timed_out"]:
-        st.warning("20 second timeout reached. Partial results are shown.")
-    if snap["source_message"]:
-        st.warning(str(snap["source_message"]))
-    if snap["error"]:
-        st.error(str(snap["error"]))
+def should_scan(interval: int) -> bool:
+    last = st.session_state.get("last_scan_ts")
+    if not last:
+        return True
+    return now_utc_ts() - float(last) >= interval
 
-    render_section("Explosive Runners Now", explosive, "No explosive runners detected yet.")
-    render_section("Early Breakout Watch", premove, "No high-quality early breakout candidates detected yet.")
 
-    st.subheader("Watched Movers")
-    if watched.empty:
-        top_skip = max(SKIP_KEYS, key=lambda key: skip_counts.get(key, 0))
-        st.warning(f"No watched movers yet. Largest skip bucket: {top_skip} ({skip_counts.get(top_skip, 0):,}).")
-    else:
-        watched_cols = [col for col in ["Ticker", "Price", "Gain %", "Volume", "RVOL", "Near High %", "Reason", "Source"] if col in watched.columns]
-        st.dataframe(watched[watched_cols], use_container_width=True, hide_index=True)
-
-    with st.expander("Extra details and diagnostics", expanded=False):
-        details = pd.concat([explosive, premove], ignore_index=True) if not explosive.empty or not premove.empty else pd.DataFrame()
-        if not details.empty:
-            extra_cols = [
-                "Ticker",
-                "Setup Type",
-                "Gap %",
-                "Intraday Gain %",
-                "Last 2 Candle Move %",
-                "Volume Acceleration",
-                "Near High %",
-                "VWAP Reclaim",
-                "20D Breakout",
-                "Risk/Reward",
-                "Avoid Reason",
-                "Data Quality",
-                "Source",
-            ]
-            st.dataframe(details[[col for col in extra_cols if col in details.columns]], use_container_width=True, hide_index=True)
-        if not source_debug.empty:
-            st.dataframe(source_debug, use_container_width=True, hide_index=True)
-        st.dataframe(pd.DataFrame([{"Reason": key, "Count": skip_counts.get(key, 0)} for key in SKIP_KEYS]), use_container_width=True, hide_index=True)
+def run_scan(config: ScanConfig, optional_watchlist: str, lang: str) -> None:
+    discovery = discover_tickers(optional_watchlist, config.max_tickers, config.request_timeout)
+    progress = st.progress(0, text="Scanning..." if not is_arabic(lang) else "جار الفحص...")
+    frame = scan_universe(discovery.tickers, config, progress=progress)
+    progress.empty()
+    st.session_state.scan_df = frame
+    st.session_state.last_scan_ts = now_utc_ts()
+    st.session_state.source_counts = discovery.sources
+    st.session_state.discovery_message = discovery.message
 
 
 def main() -> None:
-    st.set_page_config(page_title="Small-Cap Explosive Runner Scanner", layout="wide")
-    apply_theme()
-    state = get_state()
-    ensure_scanner(state)
-    snap = snapshot(state)
-    settings: ScannerSettings = snap["settings"]  # type: ignore[assignment]
-
-    st.title("Small-Cap Explosive Runner Scanner")
-    st.caption("Ranks explosive runners and pre-breakout pressure without pretending every signal is a trade.")
+    st.set_page_config(page_title=APP_TITLE, page_icon="📈", layout="wide")
+    initialize_state()
 
     with st.sidebar:
-        st.header("Scanner Controls")
-        cloud_fast = st.toggle("Cloud Fast Mode", value=settings.cloud_fast_mode)
-        local_full = st.toggle("Local Full Mode", value=not settings.cloud_fast_mode)
-        if local_full:
-            cloud_fast = False
-        max_limit = 150 if cloud_fast else 1000
-        max_tickers = st.slider("Max tickers", 50, max_limit, min(settings.max_tickers, max_limit), step=10)
-        workers = st.slider("Workers", 1, 12, min(settings.max_workers, 12), step=1)
-        scan_interval = st.slider("Scan interval seconds", 15, 300, settings.scan_interval_seconds, step=5)
-        scan_timeout = st.slider("Scan timeout seconds", 5, 30, settings.scan_timeout_seconds, step=1)
-        max_price = st.slider("Maximum price", 1.0, 200.0, float(settings.max_price), step=1.0)
-        min_rvol = st.slider("Minimum RVOL for VALID TRADE", 0.5, 3.0, float(settings.min_rvol_for_valid), step=0.1)
-        market_summary_scraper = st.toggle("Market Summary Scraper", value=settings.market_summary_scraper)
-        with st.expander("Advanced", expanded=False):
-            watchlist = st.text_area("Optional advanced watchlist", value=settings.optional_watchlist, height=80)
-            st.caption("Automatic discovery is primary. Use this only to force-check names.")
+        lang = st.radio("Language / اللغة", ["English", "Arabic"], horizontal=True, key="language")
+        inject_theme(lang)
+        st.caption(APP_VERSION)
+        st.divider()
+        st.subheader(tr("scanner_controls", lang))
+        cloud_fast = st.toggle(tr("cloud_fast", lang), value=True)
+        config = ScanConfig() if cloud_fast else ScanConfig(max_tickers=220, workers=10, scan_timeout=28)
+        with st.expander(tr("advanced_watchlist", lang)):
+            optional_watchlist = st.text_area(
+                tr("advanced_watchlist", lang),
+                value=st.session_state.optional_watchlist,
+                help=tr("advanced_help", lang),
+                height=90,
+                label_visibility="collapsed",
+            )
+            st.session_state.optional_watchlist = optional_watchlist
+        scan_clicked = st.button(tr("refresh", lang), use_container_width=True)
+        st.caption(f"{tr('next_refresh', lang)}: {config.scan_interval}s")
 
-        new_settings = ScannerSettings(
-            cloud_fast_mode=cloud_fast,
-            scan_interval_seconds=int(scan_interval),
-            scan_timeout_seconds=int(scan_timeout),
-            max_tickers=int(max_tickers),
-            max_workers=int(workers),
-            max_price=float(max_price),
-            min_rvol_for_valid=float(min_rvol),
-            market_summary_scraper=market_summary_scraper,
-            optional_watchlist=watchlist,
+    inject_theme(lang)
+
+    st.title(tr("page_title", lang))
+    st.caption(tr("subtitle", lang))
+
+    if scan_clicked or should_scan(config.scan_interval):
+        run_scan(config, st.session_state.optional_watchlist, lang)
+
+    frame: pd.DataFrame = st.session_state.scan_df
+    valid_count = int(frame.get("valid_trade", pd.Series(dtype=bool)).fillna(False).sum()) if not frame.empty else 0
+    hot_count = int((frame.get("gain_pct", pd.Series(dtype=float)).fillna(0) >= 10).sum()) if not frame.empty else 0
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric(tr("last_scan", lang), utc_clock(st.session_state.last_scan_ts))
+    k2.metric(tr("universe", lang), f"{len(frame):,}")
+    k3.metric(tr("valid", lang), f"{valid_count:,}")
+    k4.metric(tr("hot", lang), f"{hot_count:,}")
+
+    with st.expander(tr("sources", lang)):
+        sources = pd.DataFrame(
+            [{"Source": name, "Tickers": count} for name, count in st.session_state.source_counts.items()]
         )
-        if st.button("Run scan now", type="primary", use_container_width=True):
-            restart_scanner(state, new_settings)
-            st.rerun()
-        if st.button("Clear cache / Reset scanner", use_container_width=True):
-            restart_scanner(state, ScannerSettings(), clear_cache=True)
-            st.rerun()
-        with state.lock:
-            state.settings = new_settings
+        st.write(st.session_state.discovery_message)
+        st.dataframe(sources, use_container_width=True, hide_index=True)
 
-    render_dashboard(snapshot(state))
+    if frame.empty:
+        st.warning(tr("no_results", lang))
+    else:
+        render_section(frame, "explosive", "Explosive Runners Now", lang, config.max_cards_per_section)
+        render_section(frame, "breakout", "Breakout Watch", lang, config.max_cards_per_section)
+        render_section(frame, "dip", "Dip Buy Zones", lang, config.max_cards_per_section)
+        render_section(frame, "watched", "Watched Movers", lang, config.max_cards_per_section)
+
+        with st.expander(tr("table", lang)):
+            st.dataframe(compact_table(frame.head(50), lang), use_container_width=True, hide_index=True)
+
+    st.caption(tr("footer", lang))
+
+    elapsed = now_utc_ts() - float(st.session_state.last_scan_ts or now_utc_ts())
+    if elapsed >= config.scan_interval:
+        st.rerun()
 
 
 if __name__ == "__main__":
