@@ -23,7 +23,7 @@ import yfinance as yf
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 logging.getLogger("urllib3").setLevel(logging.CRITICAL)
 
-APP_VERSION = "pre-move-momentum-scanner-polished-ui-2026-04-30"
+APP_VERSION = "pre-move-momentum-scanner-explosive-runners-2026-04-30"
 YAHOO_SCREENER_URL = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
 YAHOO_TRENDING_URL = "https://query1.finance.yahoo.com/v1/finance/trending/US"
 NASDAQ_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
@@ -163,6 +163,8 @@ def round_cent(value: float) -> float:
 
 
 def status_tone(status: str) -> str:
+    if status in {"HOT RUNNER", "BREAKOUT IMMINENT"}:
+        return "red"
     if status == "VALID TRADE":
         return "green"
     if status in {"❌ NO LONG", "INVALID DATA"}:
@@ -494,9 +496,11 @@ def analyze_ticker(ticker: str, state: AppState, settings: ScannerSettings) -> t
     volume = int(safe_float(today["Volume"].sum(), 0))
     gap_pct = ((current_price - previous_close) / previous_close) * 100
     gain_pct = gap_pct
+    intraday_gain_pct = ((current_price - open_price) / open_price) * 100 if open_price > 0 else 0.0
     near_high_pct = ((day_high - current_price) / current_price) * 100 if current_price > 0 else 100.0
     rvol = relative_volume(volume, analysis)
     accel, ignition = volume_acceleration(analysis)
+    explosive_move = gap_pct >= 10 or intraday_gain_pct >= 10 or (rvol >= 2 and accel >= 2)
     compression_pct, is_tight = tight_consolidation(analysis, current_price, day_high)
     higher_lows = has_higher_lows(analysis)
     vwap = calc_vwap(analysis)
@@ -510,6 +514,7 @@ def analyze_ticker(ticker: str, state: AppState, settings: ScannerSettings) -> t
         "Ticker": ticker,
         "Current Price": round(current_price, 4),
         "Gap %": round(gap_pct, 2),
+        "Intraday Gain %": round(intraday_gain_pct, 2),
         "RVOL": rvol,
         "Volume": volume,
         "Near High %": round(near_high_pct, 2),
@@ -536,6 +541,12 @@ def analyze_ticker(ticker: str, state: AppState, settings: ScannerSettings) -> t
     )
 
     reason_parts: list[str] = []
+    if gap_pct >= 10:
+        reason_parts.append("gap explosion")
+    if rvol >= 2 and accel >= 2:
+        reason_parts.append("volume surge")
+    if intraday_gain_pct >= 10:
+        reason_parts.append("momentum spike")
     if ignition:
         reason_parts.append("volume ignition")
     if rvol >= 1.3:
@@ -556,7 +567,7 @@ def analyze_ticker(ticker: str, state: AppState, settings: ScannerSettings) -> t
         reason_parts.append("low-float keyword boost")
 
     has_pressure = score >= 35 or near_high_pct <= 3 or ignition or is_tight or vwap_reclaim
-    if not has_pressure:
+    if not (has_pressure or explosive_move):
         return None, watched, "no_momentum"
 
     support_low = round_cent(max(day_low, current_price * 0.965))
@@ -574,6 +585,9 @@ def analyze_ticker(ticker: str, state: AppState, settings: ScannerSettings) -> t
     if data_stale:
         status = "INVALID DATA"
         setup_type = "INVALID DATA"
+    elif explosive_move:
+        status = "HOT RUNNER"
+        setup_type = "EXPLOSIVE RUNNER"
     elif gain_pct < -2 or below_open_or_vwap:
         status = "WAIT FOR REVERSAL"
         setup_type = "WAIT FOR REVERSAL"
@@ -620,6 +634,7 @@ def analyze_ticker(ticker: str, state: AppState, settings: ScannerSettings) -> t
         "Pre-Move Score": score,
         "Status": status,
         "Setup Type": setup_type,
+        "Hot Runner": explosive_move,
         "Trigger Entry": entry,
         "Stop": stop_out,
         "Target 1": target_1_out,
@@ -629,6 +644,7 @@ def analyze_ticker(ticker: str, state: AppState, settings: ScannerSettings) -> t
         "Volume Accel": accel,
         "Near High %": round(near_high_pct, 2),
         "Gap %": round(gap_pct, 2),
+        "Intraday Gain %": round(intraday_gain_pct, 2),
         "Volume": volume,
         "Data Quality": data_quality,
         "Confirmation": confirmation,
@@ -648,23 +664,33 @@ def rank_candidates(rows: list[dict[str, object]]) -> pd.DataFrame:
         return pd.DataFrame()
     df = pd.DataFrame(rows).drop_duplicates(subset=["Ticker"], keep="last")
     status_rank = {
+        "HOT RUNNER": 0,
         "VALID TRADE": 0,
-        "BREAKOUT IMMINENT": 1,
-        "PRE-MOVE WATCH": 2,
-        "WAIT FOR TRIGGER": 3,
-        "WAIT FOR PULLBACK": 4,
-        "WAIT FOR REVERSAL": 5,
-        "❌ NO LONG": 6,
-        "INVALID DATA": 7,
+        "BREAKOUT IMMINENT": 2,
+        "PRE-MOVE WATCH": 3,
+        "WAIT FOR TRIGGER": 4,
+        "WAIT FOR PULLBACK": 5,
+        "WAIT FOR REVERSAL": 6,
+        "❌ NO LONG": 7,
+        "INVALID DATA": 8,
     }
     df["_status_rank"] = df["Status"].map(status_rank).fillna(9)
-    return df.sort_values(["_status_rank", "Pre-Move Score", "RVOL"], ascending=[True, False, False]).drop(columns=["_status_rank"])
+    if "Hot Runner" in df.columns:
+        df["_hot_rank"] = np.where(df["Hot Runner"].astype(bool), 0, 1)
+    else:
+        df["_hot_rank"] = 1
+    return df.sort_values(["_hot_rank", "_status_rank", "Pre-Move Score", "RVOL"], ascending=[True, True, False, False]).drop(columns=["_hot_rank", "_status_rank"])
 
 
 def rank_watched(rows: list[dict[str, object]]) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows).drop_duplicates(subset=["Ticker"], keep="last")
+    if "Status" in df.columns:
+        df["_hot_rank"] = np.where(df["Status"].astype(str).eq("HOT RUNNER"), 0, 1)
+        sort_cols = ["_hot_rank"] + [col for col in ["Pre-Move Score", "Gap %", "RVOL", "Volume"] if col in df.columns]
+        ascending = [True] + [False] * (len(sort_cols) - 1)
+        return df.sort_values(sort_cols, ascending=ascending).drop(columns=["_hot_rank"]).head(150)
     sort_cols = [col for col in ["Pre-Move Score", "Gap %", "RVOL", "Volume"] if col in df.columns]
     return df.sort_values(sort_cols, ascending=[False] * len(sort_cols)).head(150) if sort_cols else df.head(150)
 
@@ -870,6 +896,7 @@ def apply_theme() -> None:
                 --green: #22c55e;
                 --orange: #f59e0b;
                 --red: #ef4444;
+                --hot: #ff2d55;
             }
             .stApp {
                 background:
@@ -946,6 +973,27 @@ def apply_theme() -> None:
                 font-size: 0.78rem;
                 white-space: nowrap;
             }
+            .pm-hot-card {
+                border: 1px solid rgba(255, 45, 85, 0.55);
+                border-radius: 16px;
+                padding: 0.65rem;
+                background: radial-gradient(circle at top right, rgba(255, 45, 85, 0.2), transparent 12rem);
+                box-shadow: 0 0 34px rgba(255, 45, 85, 0.16);
+                margin-bottom: 0.5rem;
+            }
+            .pm-hot-label {
+                display: inline-flex;
+                align-items: center;
+                border-radius: 999px;
+                padding: 0.18rem 0.58rem;
+                font-size: 0.78rem;
+                font-weight: 800;
+                letter-spacing: 0.02em;
+                color: #fff;
+                background: linear-gradient(135deg, #ff2d55, #f97316);
+                box-shadow: 0 0 18px rgba(255, 45, 85, 0.35);
+                white-space: nowrap;
+            }
             .pm-mobile-cards { display: none; }
             [data-testid="stDataFrame"] div,
             [data-testid="stDataFrame"] span {
@@ -978,6 +1026,7 @@ def render_priority_card(row: pd.Series) -> None:
     with st.container(border=True):
         ticker = str(row.get("Ticker", "N/A"))
         status = str(row.get("Status", "WAIT FOR TRIGGER"))
+        hot_runner = bool(row.get("Hot Runner", False)) or status == "HOT RUNNER"
         score = safe_float(row.get("Pre-Move Score"), 0)
         reason_text = str(row.get("Why This May Run", ""))
         chips = []
@@ -992,9 +1041,15 @@ def render_priority_card(row: pd.Series) -> None:
                 chips.append(label)
         chips = chips[:3] or ["watching pressure"]
 
-        head = st.columns([0.52, 0.48])
+        if hot_runner:
+            st.markdown("<div class='pm-hot-card'>", unsafe_allow_html=True)
+        head = st.columns([0.45, 0.27, 0.28])
         head[0].markdown(f"<div class='pm-card-title'>{ticker}</div>", unsafe_allow_html=True)
-        head[1].markdown(status_badge(status))
+        if hot_runner:
+            head[1].markdown("<span class='pm-hot-label'>HOT RUNNER</span>", unsafe_allow_html=True)
+        else:
+            head[1].empty()
+        head[2].markdown(status_badge(status))
         st.caption(str(row.get("Setup Type", "PRE-MOVE WATCH")))
 
         st.progress(min(max(score / 100, 0), 1), text=f"Pre-Move Score {fmt_score(score)}")
@@ -1009,6 +1064,8 @@ def render_priority_card(row: pd.Series) -> None:
         chip_html = "".join(f"<span class='pm-chip'>{chip}</span>" for chip in chips)
         st.markdown(f"<div class='pm-chip-row'>{chip_html}</div>", unsafe_allow_html=True)
         st.caption(reason_text)
+        if hot_runner:
+            st.markdown("</div>", unsafe_allow_html=True)
 
 
 def compact_reason(value: object) -> str:
@@ -1020,10 +1077,11 @@ def compact_reason(value: object) -> str:
 def make_compact_table(candidates: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     for _, row in candidates.iterrows():
+        hot_runner = bool(row.get("Hot Runner", False)) or str(row.get("Status", "")) == "HOT RUNNER"
         rows.append(
             {
                 "Ticker": str(row.get("Ticker", "")),
-                "Status": str(row.get("Status", "")),
+                "Status": "HOT RUNNER" if hot_runner else str(row.get("Status", "")),
                 "Score": fmt_score(row.get("Pre-Move Score")),
                 "Price": fmt_currency(row.get("Current Price")),
                 "Trigger": fmt_currency(row.get("Trigger Entry")),
@@ -1031,7 +1089,7 @@ def make_compact_table(candidates: pd.DataFrame) -> pd.DataFrame:
                 "Target 1": fmt_currency(row.get("Target 1")),
                 "RVOL": fmt_rvol(row.get("RVOL")),
                 "Gap %": fmt_pct(row.get("Gap %")),
-                "Reason": compact_reason(row.get("Why This May Run")),
+                "Reason": ("HOT RUNNER, " if hot_runner else "") + compact_reason(row.get("Why This May Run")),
             }
         )
     return pd.DataFrame(rows)
