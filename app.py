@@ -60,16 +60,16 @@ class ScannerSettings:
     fast_mode: bool = True
     scan_interval_seconds: int = 7
     min_price: float = 0.50
-    max_price: float = 20.00
+    max_price: float = 100.00
     min_volume: int = 100_000
     min_gain_pct: float = 0.0
     min_relative_volume: float = 1.3
     near_high_threshold_pct: float = 3.0
     volume_acceleration_threshold: float = 1.5
     halt_spike_threshold_pct: float = 15.0
-    max_tickers: int = 400
-    active_movers_count: int = 200
-    explore_tickers_count: int = 250
+    max_tickers: int = 1000
+    active_movers_count: int = 500
+    explore_tickers_count: int = 500
     batch_size: int = 40
     max_workers: int = 20
     output_limit: int = 100
@@ -93,6 +93,8 @@ class AppState:
     cycle_count: int
     error: Optional[str]
     download_cache: dict[tuple[str, str, str, bool], tuple[float, pd.DataFrame]]
+    previous_close_cache: dict[str, tuple[float, Optional[float]]]
+    average_volume_cache: dict[str, tuple[float, Optional[float]]]
     universe_cache: tuple[float, list[str]] | None
 
 
@@ -112,6 +114,8 @@ def make_empty_state() -> AppState:
         cycle_count=0,
         error=None,
         download_cache={},
+        previous_close_cache={},
+        average_volume_cache={},
         universe_cache=None,
     )
 
@@ -240,31 +244,33 @@ def get_us_tickers(state: AppState) -> list[str]:
 
 def get_active_movers(max_count: int) -> list[str]:
     headers = {"User-Agent": "Mozilla/5.0"}
-    params = {"scrIds": "day_gainers", "count": min(max_count, 250)}
-    try:
-        response = requests.get(YAHOO_GAINERS_URL, params=params, headers=headers, timeout=4)
-        response.raise_for_status()
-        quotes = response.json()["finance"]["result"][0]["quotes"]
-    except Exception:
-        return []
-
     tickers: list[str] = []
-    for quote in quotes:
-        symbol = str(quote.get("symbol", "")).upper().strip()
-        quote_type = str(quote.get("quoteType", "")).upper()
-        market = str(quote.get("market", "")).lower()
-        if quote_type == "EQUITY" and market in {"us_market", ""} and is_valid_ticker(symbol):
-            tickers.append(symbol)
-    return list(dict.fromkeys(tickers))
+    for screen_id in ("day_gainers", "most_actives"):
+        params = {"scrIds": screen_id, "count": min(max_count, 250)}
+        try:
+            response = requests.get(YAHOO_GAINERS_URL, params=params, headers=headers, timeout=4)
+            response.raise_for_status()
+            quotes = response.json()["finance"]["result"][0]["quotes"]
+        except Exception:
+            continue
+
+        for quote in quotes:
+            symbol = str(quote.get("symbol", "")).upper().strip()
+            quote_type = str(quote.get("quoteType", "")).upper()
+            market = str(quote.get("market", "")).lower()
+            if quote_type == "EQUITY" and market in {"us_market", ""} and is_valid_ticker(symbol):
+                tickers.append(symbol)
+    return list(dict.fromkeys(tickers))[:max_count]
 
 
 def build_scan_universe(state: AppState, settings: ScannerSettings) -> list[str]:
     all_tickers = get_us_tickers(state)
     all_set = set(all_tickers)
-    active = [ticker for ticker in get_active_movers(settings.active_movers_count) if ticker in all_set]
+    active = [ticker for ticker in get_active_movers(settings.max_tickers) if ticker in all_set]
+    active = active[: min(len(active), settings.max_tickers)]
 
     explore_pool = [ticker for ticker in all_tickers if ticker not in set(active)]
-    explore_size = min(len(explore_pool), settings.explore_tickers_count)
+    explore_size = min(len(explore_pool), settings.explore_tickers_count, max(0, settings.max_tickers - len(active)))
     explore = random.sample(explore_pool, explore_size) if explore_size else []
 
     tickers = list(dict.fromkeys(active + explore))
@@ -318,6 +324,124 @@ def cached_download(ticker: str, state: AppState, settings: ScannerSettings) -> 
     return df
 
 
+def valid_price(value: object) -> Optional[float]:
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return None
+    if np.isnan(price) or price <= 0:
+        return None
+    return price
+
+
+def get_previous_close(ticker: str, state: AppState, settings: ScannerSettings) -> Optional[float]:
+    now = time.monotonic()
+    with state.lock:
+        cached = state.previous_close_cache.get(ticker)
+        if cached and now - cached[0] <= 900:
+            return cached[1]
+
+    previous_close: Optional[float] = None
+
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            fast_info = yf.Ticker(ticker).fast_info
+        for key in ("previous_close", "regular_market_previous_close", "last_close"):
+            try:
+                previous_close = valid_price(fast_info.get(key))  # type: ignore[attr-defined]
+            except AttributeError:
+                previous_close = valid_price(getattr(fast_info, key, None))
+            if previous_close is not None:
+                break
+    except Exception:
+        previous_close = None
+
+    if previous_close is None:
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                daily = yf.download(
+                    ticker,
+                    period="7d",
+                    interval="1d",
+                    prepost=False,
+                    progress=False,
+                    auto_adjust=False,
+                    threads=False,
+                    timeout=settings.request_timeout_seconds,
+                )
+            if daily is not None and not daily.empty:
+                daily = normalize_columns(daily)
+                daily = daily.dropna(subset=["Close"]) if "Close" in daily else pd.DataFrame()
+                if not daily.empty:
+                    today_et = pd.Timestamp.now(tz="America/New_York").date()
+                    daily_dates = pd.to_datetime(daily.index).date
+                    prior_days = daily.loc[daily_dates < today_et]
+                    source = prior_days if not prior_days.empty else daily
+                    previous_close = valid_price(source["Close"].iloc[-1])
+        except Exception:
+            previous_close = None
+
+    with state.lock:
+        state.previous_close_cache[ticker] = (now, previous_close)
+        if len(state.previous_close_cache) > 3000:
+            state.previous_close_cache = dict(list(state.previous_close_cache.items())[-1500:])
+    return previous_close
+
+
+def get_average_volume(ticker: str, state: AppState, settings: ScannerSettings) -> Optional[float]:
+    now = time.monotonic()
+    with state.lock:
+        cached = state.average_volume_cache.get(ticker)
+        if cached and now - cached[0] <= 900:
+            return cached[1]
+
+    average_volume: Optional[float] = None
+
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            fast_info = yf.Ticker(ticker).fast_info
+        for key in ("ten_day_average_volume", "three_month_average_volume"):
+            try:
+                average_volume = valid_price(fast_info.get(key))  # type: ignore[attr-defined]
+            except AttributeError:
+                average_volume = valid_price(getattr(fast_info, key, None))
+            if average_volume is not None:
+                break
+    except Exception:
+        average_volume = None
+
+    if average_volume is None:
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                daily = yf.download(
+                    ticker,
+                    period="30d",
+                    interval="1d",
+                    prepost=False,
+                    progress=False,
+                    auto_adjust=False,
+                    threads=False,
+                    timeout=settings.request_timeout_seconds,
+                )
+            if daily is not None and not daily.empty:
+                daily = normalize_columns(daily)
+                daily = daily.dropna(subset=["Volume"]) if "Volume" in daily else pd.DataFrame()
+                if not daily.empty:
+                    today_et = pd.Timestamp.now(tz="America/New_York").date()
+                    daily_dates = pd.to_datetime(daily.index).date
+                    prior_days = daily.loc[daily_dates < today_et]
+                    source = prior_days.tail(20) if not prior_days.empty else daily.tail(20)
+                    average_volume = valid_price(source["Volume"].mean())
+        except Exception:
+            average_volume = None
+
+    with state.lock:
+        state.average_volume_cache[ticker] = (now, average_volume)
+        if len(state.average_volume_cache) > 3000:
+            state.average_volume_cache = dict(list(state.average_volume_cache.items())[-1500:])
+    return average_volume
+
+
 def latest_session_rows(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     working = df.copy()
     if working.index.tz is None:
@@ -326,7 +450,7 @@ def latest_session_rows(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     working["session_date"] = eastern.date
     today = working[working["session_date"] == working["session_date"].max()].copy()
     regular = today.between_time("09:30", "16:00")
-    return today, regular if not regular.empty else today
+    return today, regular
 
 
 def calculate_vwap(df: pd.DataFrame) -> float:
@@ -435,36 +559,57 @@ def extract_candidate(ticker: str, state: AppState, settings: ScannerSettings) -
         return None
 
     today, regular = latest_session_rows(intraday)
-    if today.empty or regular.empty:
+    analysis_rows = regular if not regular.empty else today
+    if today.empty or analysis_rows.empty:
         return None
 
     current_price = float(today["Close"].iloc[-1])
-    open_price = float(regular["Open"].iloc[0])
-    last_regular_price = float(regular["Close"].iloc[-1])
-    previous_close = open_price
-    day_high = float(regular["High"].max())
-    day_low = float(regular["Low"].min())
+    open_price = float(regular["Open"].iloc[0]) if not regular.empty else float(today["Open"].iloc[0])
+    last_regular_price = float(regular["Close"].iloc[-1]) if not regular.empty else current_price
+    previous_close = get_previous_close(ticker, state, settings)
+    if previous_close is None:
+        return None
+    historical_average_volume = get_average_volume(ticker, state, settings)
+    day_high = float(today["High"].max())
+    day_low = float(today["Low"].min())
     volume = int(today["Volume"].sum())
 
-    if not settings.min_price <= current_price <= settings.max_price:
-        return None
     if volume < settings.min_volume:
         return None
 
-    gain_pct = ((current_price - previous_close) / previous_close) * 100 if previous_close > 0 else 0.0
+    gap_pct = ((current_price - previous_close) / previous_close) * 100 if previous_close > 0 else 0.0
+    gain_pct = gap_pct
+    premarket_gain_pct = gap_pct if gap_pct > 0 else 0.0
     after_hours_gain_pct = ((current_price - last_regular_price) / last_regular_price) * 100 if last_regular_price > 0 and len(today) > len(regular) else 0.0
-    relative_volume = estimate_relative_volume(volume, regular)
+    intraday_relative_volume = estimate_relative_volume(volume, analysis_rows)
+    daily_relative_volume = volume / historical_average_volume if historical_average_volume and historical_average_volume > 0 else 0.0
+    relative_volume = max(intraday_relative_volume, daily_relative_volume)
     near_high_pct = ((day_high - current_price) / current_price) * 100 if current_price > 0 else 100.0
-    volume_acceleration, volume_spike = detect_volume_acceleration(regular, settings.volume_acceleration_threshold)
-    compression_pct, tight_consolidation = detect_price_compression(regular, day_high, current_price)
-    higher_lows = detect_higher_lows(regular)
-    halt_candidate = detect_halt_spike(regular, current_price, settings.halt_spike_threshold_pct)
+    volume_acceleration, candle_volume_spike = detect_volume_acceleration(analysis_rows, settings.volume_acceleration_threshold)
+    volume_spike = candle_volume_spike or relative_volume >= settings.min_relative_volume
+    compression_pct, tight_consolidation = detect_price_compression(analysis_rows, day_high, current_price)
+    higher_lows = detect_higher_lows(analysis_rows)
+    halt_candidate = detect_halt_spike(analysis_rows, current_price, settings.halt_spike_threshold_pct)
     spac_boost = has_spac_low_float_boost(ticker)
     pre_breakout_setup = tight_consolidation or higher_lows
-    vwap = calculate_vwap(regular)
+    vwap = calculate_vwap(analysis_rows)
     above_vwap_pct = ((current_price - vwap) / vwap) * 100 if vwap and not np.isnan(vwap) and vwap > 0 else 0.0
+    premarket_runner = gap_pct >= 8.0
+    high_price_runner_exception = (
+        current_price > 20.0
+        and gap_pct >= 8.0
+        and premarket_gain_pct >= 5.0
+        and volume_spike
+        and relative_volume >= settings.min_relative_volume
+    )
+
+    price_in_range = current_price >= settings.min_price and current_price <= settings.max_price
+    if not price_in_range and not high_price_runner_exception:
+        return None
 
     early_momentum = (
+        premarket_runner
+        or
         relative_volume >= settings.min_relative_volume
         or near_high_pct <= settings.near_high_threshold_pct
         or volume_spike
@@ -474,7 +619,18 @@ def extract_candidate(ticker: str, state: AppState, settings: ScannerSettings) -
     if not early_momentum:
         return None
 
+    reason: list[str] = []
+    if gap_pct >= 8.0:
+        reason.append("gap up")
+    if premarket_runner:
+        reason.append("premarket runner")
+    if volume_spike:
+        reason.append("volume spike")
+    if near_high_pct <= settings.near_high_threshold_pct:
+        reason.append("near high")
+
     scan_reason: list[str] = []
+    scan_reason.extend(reason)
     if near_high_pct <= settings.near_high_threshold_pct and (tight_consolidation or higher_lows):
         scan_reason.append("early breakout setup")
     if early_momentum:
@@ -498,6 +654,8 @@ def extract_candidate(ticker: str, state: AppState, settings: ScannerSettings) -
     if settings.min_gain_pct > 0 and gain_pct >= settings.min_gain_pct:
         scan_reason.append(f"gain {gain_pct:.1f}%")
     scan_reason.append(f"volume {volume:,}")
+    if not reason:
+        reason.append("pre-momentum")
 
     return {
         "Ticker": ticker,
@@ -506,10 +664,12 @@ def extract_candidate(ticker: str, state: AppState, settings: ScannerSettings) -
         "Open": round(open_price, 4),
         "Day High": round(day_high, 4),
         "Day Low": round(day_low, 4),
+        "Gap %": round(gap_pct, 2),
+        "Premarket Gain %": round(premarket_gain_pct, 2),
         "Intraday Gain %": round(gain_pct, 2),
         "After Hours Gain %": round(after_hours_gain_pct, 2),
         "Volume": volume,
-        "Average Volume": int(float(regular["Volume"].tail(20).mean()) * 78),
+        "Average Volume": int(historical_average_volume or float(analysis_rows["Volume"].tail(20).mean()) * 78),
         "Relative Volume": round(relative_volume, 2),
         "Near High %": round(near_high_pct, 2),
         "Volume Acceleration": volume_acceleration,
@@ -520,7 +680,8 @@ def extract_candidate(ticker: str, state: AppState, settings: ScannerSettings) -
         "Pre-Breakout Setup": pre_breakout_setup,
         "Halt Candidate": halt_candidate,
         "SPAC Low Float Boost": spac_boost,
-        "Runner Label": "",
+        "Premarket Runner": premarket_runner,
+        "Runner Label": "PREMARKET RUNNER" if premarket_runner else "",
         "VWAP": vwap,
         "Above VWAP %": round(above_vwap_pct, 2),
         "Early Momentum": early_momentum,
@@ -536,6 +697,7 @@ def extract_candidate(ticker: str, state: AppState, settings: ScannerSettings) -
             above_vwap_pct,
         ),
         "Timestamp": datetime.now().isoformat(timespec="seconds"),
+        "Reason": ", ".join(reason),
         "Scan Reason": ", ".join(scan_reason),
     }
 
@@ -561,9 +723,12 @@ def scan_market(state: AppState, settings: ScannerSettings) -> tuple[pd.DataFram
     df = pd.DataFrame(rows)
     if not df.empty:
         df = df.drop_duplicates(subset=["Ticker"], keep="last")
+        df["_runner_rank"] = np.where(df["Runner Label"].astype(str).eq("PREMARKET RUNNER"), 0, 1)
         df = df.sort_values(
             [
+                "_runner_rank",
                 "Early Momentum",
+                "Gap %",
                 "Relative Volume",
                 "Near High %",
                 "Volume Acceleration",
@@ -571,10 +736,11 @@ def scan_market(state: AppState, settings: ScannerSettings) -> tuple[pd.DataFram
                 "Momentum Score",
                 "Volume",
             ],
-            ascending=[False, False, True, False, True, False, False],
-        ).head(settings.output_limit)
-        df["Runner Label"] = ""
-        df.iloc[: min(3, len(df)), df.columns.get_loc("Runner Label")] = "HIGH POTENTIAL RUNNERS"
+            ascending=[True, False, False, False, True, False, True, False, False],
+        ).drop(columns=["_runner_rank"]).head(settings.output_limit)
+        blank_runner = df["Runner Label"].astype(str).eq("")
+        top_blank_indexes = df[blank_runner].head(3).index
+        df.loc[top_blank_indexes, "Runner Label"] = "HIGH POTENTIAL RUNNERS"
     return df, skipped, len(tickers)
 
 
@@ -606,6 +772,8 @@ def calculate_trade_plan(row: pd.Series) -> dict[str, object]:
     day_high = round_cent(get_value(row, "Day High", current_price))
     day_low = round_cent(get_value(row, "Day Low", current_price))
     vwap = round_cent(get_value(row, "VWAP", current_price))
+    gap_pct = get_value(row, "Gap %")
+    premarket_gain_pct = get_value(row, "Premarket Gain %")
     gain_pct = get_value(row, "Intraday Gain %")
     after_hours_gain_pct = get_value(row, "After Hours Gain %")
     volume = int(get_value(row, "Volume"))
@@ -619,7 +787,9 @@ def calculate_trade_plan(row: pd.Series) -> dict[str, object]:
     pre_breakout_setup = bool(row.get("Pre-Breakout Setup", False))
     halt_candidate = bool(row.get("Halt Candidate", False))
     spac_boost = bool(row.get("SPAC Low Float Boost", False))
+    premarket_runner = bool(row.get("Premarket Runner", False))
     runner_label = str(row.get("Runner Label", "") or "")
+    scan_reason = str(row.get("Reason", "") or row.get("Scan Reason", ""))
 
     support_low = round_cent(max(day_low, current_price * 0.94))
     support_high = round_cent(max(support_low + 0.01, current_price * 0.975))
@@ -649,6 +819,8 @@ def calculate_trade_plan(row: pd.Series) -> dict[str, object]:
         setup_type = "WEAK / NO LONG"
     elif below_open_and_vwap:
         setup_type = "WAIT FOR REVERSAL"
+    elif premarket_runner:
+        setup_type = "PREMARKET RUNNER"
     elif current_price < support_low:
         setup_type = "Fake breakdown reclaim"
     elif after_hours_reclaim:
@@ -683,7 +855,7 @@ def calculate_trade_plan(row: pd.Series) -> dict[str, object]:
     elif current_price < support_low:
         status = "NO TRADE"
         reason = f"Price is below support low at {support_low:.2f}; long structure is broken."
-    elif extended_pct > 12 and setup_type not in {"PRE-BREAKOUT", "Halt candidate", "AFTER-HOURS RECLAIM"}:
+    elif extended_pct > 12 and setup_type not in {"PRE-BREAKOUT", "Halt candidate", "PREMARKET RUNNER", "AFTER-HOURS RECLAIM"}:
         status = "WAIT FOR PULLBACK"
         reason = f"Price is {extended_pct:.1f}% above support, so buying now would chase the move."
     elif support_high < current_price < breakout_level and not near_vwap_reclaim:
@@ -695,7 +867,7 @@ def calculate_trade_plan(row: pd.Series) -> dict[str, object]:
         stop = round_cent(min(vwap - buffer, support_low - 0.01))
         confirmation = f"Active only while price holds reclaimed VWAP at {vwap:.2f} with RVOL above 1.2x."
         invalidation = f"No long if VWAP reclaim fails and price closes below {vwap:.2f}."
-    elif setup_type in {"PRE-BREAKOUT", "Halt candidate"}:
+    elif setup_type in {"PRE-BREAKOUT", "Halt candidate", "PREMARKET RUNNER"}:
         entry = round_cent(breakout_level + 0.02)
         stop = round_cent(breakout_level - buffer)
         confirmation = f"Only valid if price reclaims {breakout_level:.2f} and holds."
@@ -796,6 +968,7 @@ def calculate_trade_plan(row: pd.Series) -> dict[str, object]:
     score += 18 if tight_consolidation else 0
     score += 14 if higher_lows else 0
     score += 18 if halt_candidate else 0
+    score += 24 if premarket_runner else 0
     score += 10 if spac_boost else 0
     score += 10 if near_vwap_reclaim else 0
     score += 10 if near_breakout else 0
@@ -825,6 +998,8 @@ def calculate_trade_plan(row: pd.Series) -> dict[str, object]:
         "Status": status,
         "Setup Type": setup_type,
         "Current Price": current_price,
+        "Gap %": round(gap_pct, 2),
+        "Premarket Gain %": round(premarket_gain_pct, 2),
         "Intraday Gain %": round(gain_pct, 2),
         "Volume": volume,
         "Relative Volume": round(relative_volume, 2),
@@ -839,6 +1014,7 @@ def calculate_trade_plan(row: pd.Series) -> dict[str, object]:
         "Data Consistent": data_consistent,
         "Price Near Entry": price_near_entry,
         "Runner Label": runner_label,
+        "Reason": scan_reason,
         "Near High %": round(near_high_pct, 2),
         "Volume Acceleration": round(volume_acceleration, 2),
         "Compression %": round(compression_pct, 2),
@@ -863,7 +1039,12 @@ def analyze_candidates(candidates_df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     if "Runner Label" in df.columns:
-        df["_runner_rank"] = np.where(df["Runner Label"].astype(str).eq("HIGH POTENTIAL RUNNERS"), 0, 1)
+        runner_labels = df["Runner Label"].astype(str)
+        df["_runner_rank"] = np.select(
+            [runner_labels.eq("PREMARKET RUNNER"), runner_labels.eq("HIGH POTENTIAL RUNNERS")],
+            [0, 1],
+            default=2,
+        )
     else:
         df["_runner_rank"] = 1
     status_rank = {
@@ -1082,7 +1263,10 @@ def render_dynamic_sections(
         "Ticker",
         "Status",
         "Setup Type",
+        "Reason",
         "Current Price",
+        "Gap %",
+        "Premarket Gain %",
         "Intraday Gain %",
         "Relative Volume",
         "Near High %",
@@ -1164,7 +1348,8 @@ def main() -> None:
         st.header("Controls")
         fast_mode = st.toggle("FAST MODE", value=settings.fast_mode)
         scan_interval = st.slider("Scan interval seconds", min_value=5, max_value=30, value=int(settings.scan_interval_seconds), step=1)
-        max_tickers = st.slider("Tickers per scan", min_value=100, max_value=600, value=int(settings.max_tickers), step=50)
+        max_tickers = st.slider("Tickers per scan", min_value=100, max_value=1500, value=int(settings.max_tickers), step=50)
+        max_price = st.slider("Maximum price", min_value=1.0, max_value=200.0, value=float(settings.max_price), step=1.0)
         min_volume = st.number_input("Minimum volume", min_value=0, value=int(settings.min_volume), step=25_000)
         max_workers = st.slider("Workers", min_value=10, max_value=25, value=int(settings.max_workers), step=1)
         live_updates = st.toggle("Live placeholder updates", value=True)
@@ -1174,6 +1359,7 @@ def main() -> None:
         new_settings = ScannerSettings(
             fast_mode=fast_mode,
             scan_interval_seconds=scan_interval,
+            max_price=float(max_price),
             min_volume=int(min_volume),
             max_tickers=int(max_tickers),
             max_workers=int(max_workers),
