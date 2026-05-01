@@ -787,30 +787,9 @@ def apply_theme(lang: str) -> None:
             line-height: 1.05;
             font-variant-numeric: tabular-nums;
         }}
-        .note-grid {{
-            display: grid;
-            grid-template-columns: repeat(2, minmax(0, 1fr));
-            gap: .8rem;
-            margin-top: .8rem;
-        }}
-        .note {{
-            border-radius: 12px;
-            background: rgba(255,255,255,.045);
-            border: 1px solid rgba(255,255,255,.08);
-            padding: .75rem;
-            text-align: {align};
-        }}
-        .note-label {{
-            color: #aebbb5;
-            font-size: .78rem;
-            margin-bottom: .25rem;
-            font-weight: 700;
-        }}
-        .note-text {{ color: #edf8f1; font-size: .9rem; line-height: 1.45; }}
         @media (max-width: 760px) {{
             .trade-head {{ display: block; }}
             .status-pill {{ display: inline-block; margin-top: .6rem; }}
-            .note-grid {{ grid-template-columns: 1fr; }}
         }}
         </style>
         """,
@@ -878,13 +857,10 @@ def plan_comments(row: pd.Series, lang: str) -> dict[str, str]:
     }
 
 
-def render_note(label: str, text: str) -> str:
-    return f"""
-        <div class="note">
-            <div class="note-label">{html.escape(label)}</div>
-            <div class="note-text">{html.escape(text)}</div>
-        </div>
-    """
+def render_note_card(label: str, text: str) -> None:
+    with st.container(border=True):
+        st.markdown(f"**{label}**")
+        st.write(text if text else "N/A")
 
 
 def render_trade_card(row: pd.Series, lang: str) -> None:
@@ -923,15 +899,17 @@ def render_trade_card(row: pd.Series, lang: str) -> None:
             with col:
                 render_metric_card(label, value)
 
-    notes_html = "".join(
-        [
-            render_note(tr("confirmation", lang), comments["confirmation"]),
-            render_note(tr("invalidation", lang), comments["invalidation"]),
-            render_note(tr("why", lang), comments["why"]),
-            render_note(tr("avoid", lang), comments["avoid"]),
-        ]
-    )
-    st.markdown(f'<div class="note-grid">{notes_html}</div>', unsafe_allow_html=True)
+    notes = [
+        (tr("confirmation", lang), comments["confirmation"]),
+        (tr("invalidation", lang), comments["invalidation"]),
+        (tr("why", lang), comments["why"]),
+        (tr("avoid", lang), comments["avoid"]),
+    ]
+    for i in range(0, len(notes), 2):
+        cols = st.columns(2)
+        for col, (label, text) in zip(cols, notes[i : i + 2]):
+            with col:
+                render_note_card(label, text)
 
     with st.expander(tr("details", lang)):
         details = pd.DataFrame(
