@@ -1008,20 +1008,56 @@ def apply_theme(lang: str) -> None:
         f"""
         <style>
         :root {{ color-scheme: dark; }}
+        html, body, .stApp {{
+            word-break: normal !important;
+            overflow-wrap: normal !important;
+            hyphens: none !important;
+        }}
         .stApp {{
             background:
                 radial-gradient(circle at top left, rgba(22, 163, 127, .22), transparent 30rem),
                 linear-gradient(135deg, #07100f 0%, #0b1118 55%, #10140f 100%);
             color: #f4fbf7;
-            direction: {direction};
         }}
         .block-container {{
             max-width: 1280px;
             padding-top: 1.25rem;
             padding-bottom: 2rem;
         }}
-        h1, h2, h3, p, label, div[data-testid="stMarkdownContainer"] {{ text-align: {align}; }}
-        section[data-testid="stSidebar"] {{ background: #08100f; }}
+        .app-shell.ar,
+        section.main .block-container {{
+            direction: {direction};
+            text-align: {align};
+        }}
+        .app-shell.en {{
+            direction: ltr;
+            text-align: left;
+        }}
+        section.main h1,
+        section.main h2,
+        section.main h3,
+        section.main p,
+        section.main div[data-testid="stMarkdownContainer"] {{
+            text-align: {align};
+        }}
+        section[data-testid="stSidebar"] {{
+            background: #08100f;
+        }}
+        section[data-testid="stSidebar"],
+        section[data-testid="stSidebar"] * {{
+            direction: ltr !important;
+            text-align: left !important;
+            word-break: keep-all !important;
+            overflow-wrap: normal !important;
+            white-space: normal !important;
+            hyphens: none !important;
+        }}
+        section[data-testid="stSidebar"] label,
+        section[data-testid="stSidebar"] p,
+        section[data-testid="stSidebar"] span,
+        section[data-testid="stSidebar"] div {{
+            writing-mode: horizontal-tb !important;
+        }}
         .stButton button {{
             min-height: 2.5rem;
             border-radius: 8px;
@@ -1035,14 +1071,14 @@ def apply_theme(lang: str) -> None:
             border-radius: 8px;
             padding: .85rem 1rem;
         }}
-        div[data-testid="stDataFrame"] {{
+        section.main div[data-testid="stDataFrame"] {{
             border: 1px solid rgba(255, 255, 255, .08);
             border-radius: 8px;
             overflow: hidden;
             direction: {direction};
         }}
-        div[data-testid="stDataFrame"] div,
-        div[data-testid="stDataFrame"] span {{
+        section.main div[data-testid="stDataFrame"] div,
+        section.main div[data-testid="stDataFrame"] span {{
             text-align: {align};
         }}
         .trade-card {{
@@ -1116,6 +1152,7 @@ def apply_theme(lang: str) -> None:
         @media (max-width: 760px) {{
             .trade-head {{ display: block; }}
             .status-pill {{ display: inline-block; margin-top: .6rem; }}
+            .metric-card {{ min-height: 88px; }}
         }}
         </style>
         """,
@@ -1377,11 +1414,17 @@ def run_scan(config: ScanConfig, optional_watchlist: str, lang: str) -> None:
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, page_icon="📈", layout="wide")
     initialize_state()
+    current_lang = st.session_state.get("language", "English")
 
     with st.sidebar:
-        lang = st.radio("Language / اللغة", ["English", "Arabic"], horizontal=True, key="language")
-        apply_theme(lang)
-        st.caption(APP_VERSION)
+        lang_label = "اللغة" if is_arabic(current_lang) else "Language"
+        lang = st.selectbox(
+            lang_label,
+            ["English", "Arabic"],
+            index=0 if current_lang == "English" else 1,
+            key="language",
+        )
+        st.caption("v2026-05-01")
         st.divider()
         st.subheader("Scanner" if not is_arabic(lang) else "الماسح")
         cloud_fast = st.toggle(tr("cloud_fast", lang), value=True)
@@ -1398,6 +1441,8 @@ def main() -> None:
         st.caption(f"{tr('next_refresh', lang)}: {config.scan_interval}s")
 
     apply_theme(lang)
+    shell_class = "ar" if is_arabic(lang) else "en"
+    st.markdown(f'<div class="app-shell {shell_class}">', unsafe_allow_html=True)
     st.title(tr("app_title", lang))
     st.caption(tr("subtitle", lang))
 
@@ -1439,6 +1484,7 @@ def main() -> None:
             st.dataframe(compact_table(frame.head(60), lang), use_container_width=True, hide_index=True)
 
     st.caption(tr("footer", lang))
+    st.markdown("</div>", unsafe_allow_html=True)
 
     elapsed = now_ts() - float(st.session_state.last_scan_ts or now_ts())
     if elapsed >= config.scan_interval:
