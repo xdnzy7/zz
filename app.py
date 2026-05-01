@@ -8,6 +8,7 @@ import math
 import re
 import time
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -37,6 +38,8 @@ FALLBACK_RUNNERS = [
 ]
 
 SETUP_AR = {
+    "EARLY FIRE": "بداية اشتعال",
+    "HOT RUNNER — WAIT FOR PULLBACK": "سهم ساخن — انتظر رجوع السعر",
     "BREAKOUT WATCH": "مراقبة اختراق",
     "DIP BUY ZONE": "منطقة شراء على النزول",
     "MOMENTUM TRIGGER": "تفعيل الزخم",
@@ -67,6 +70,10 @@ TEXT = {
         "details": "Extra details",
         "no_results": "No clean setups in this section. The scanner is intentionally selective.",
         "explosive": "Explosive Runners Now",
+        "premarket": "Premarket Runners",
+        "regular": "Regular Market Movers",
+        "afterhours": "After-Hours Runners",
+        "early_fire": "Early Fire",
         "breakout": "Breakout Watch",
         "dip": "Dip Buy Zones",
         "watched": "Watched Movers",
@@ -92,13 +99,22 @@ TEXT = {
         "status": "Status",
         "source": "Source",
         "mode": "Scanner mode",
+        "session": "Session",
+        "data_quality": "Data Quality",
         "footer": "Not financial advice. This app filters live conditions and builds risk-defined plans; it does not predict outcomes.",
         "valid_trade": "VALID TRADE",
+        "hot_runner_wait": "HOT RUNNER — WAIT FOR PULLBACK",
+        "early_fire_status": "EARLY FIRE",
         "watch": "WATCH",
         "wait": "WAIT",
         "caution": "CAUTION",
         "invalid": "INVALID",
         "scalp": "SCALP",
+        "regular_session": "REGULAR",
+        "premarket_session": "PREMARKET",
+        "afterhours_session": "AFTER HOURS",
+        "no_extended_feed": "No extended-hours feed",
+        "live_feed": "Live quote feed",
         "flat": "No change",
     },
     "Arabic": {
@@ -119,6 +135,10 @@ TEXT = {
         "details": "تفاصيل إضافية",
         "no_results": "لا توجد فرص نظيفة في هذا القسم. الماسح انتقائي عمدا.",
         "explosive": "الأسهم المنفجرة الآن",
+        "premarket": "أسهم قبل الافتتاح",
+        "regular": "متحركات السوق المفتوح",
+        "afterhours": "أسهم بعد الإغلاق",
+        "early_fire": "بداية اشتعال",
         "breakout": "مراقبة الاختراق",
         "dip": "مناطق الشراء على النزول",
         "watched": "أسهم تحت المراقبة",
@@ -144,13 +164,22 @@ TEXT = {
         "status": "الحالة",
         "source": "المصدر",
         "mode": "وضع الماسح",
+        "session": "الجلسة",
+        "data_quality": "جودة البيانات",
         "footer": "ليست نصيحة مالية. التطبيق يرشح الشروط الحية ويبني خطة مخاطرة؛ ولا يتنبأ بالنتائج.",
         "valid_trade": "صفقة صالحة",
+        "hot_runner_wait": "سهم ساخن — انتظر رجوع السعر",
+        "early_fire_status": "بداية اشتعال",
         "watch": "مراقبة",
         "wait": "انتظار",
         "caution": "حذر",
         "invalid": "غير صالح",
         "scalp": "مضاربة",
+        "regular_session": "السوق مفتوح",
+        "premarket_session": "قبل الافتتاح",
+        "afterhours_session": "بعد الإغلاق",
+        "no_extended_feed": "لا توجد بيانات ممتدة",
+        "live_feed": "بيانات أسعار حية",
         "flat": "بدون تغيير",
     },
 }
@@ -252,6 +281,45 @@ def utc_clock(ts: float | None) -> str:
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%H:%M:%S UTC")
 
 
+def get_market_session() -> str:
+    eastern = datetime.now(ZoneInfo("America/New_York"))
+    if eastern.weekday() >= 5:
+        return "AFTER_HOURS"
+    minutes = eastern.hour * 60 + eastern.minute
+    if 4 * 60 <= minutes < 9 * 60 + 30:
+        return "PREMARKET"
+    if 9 * 60 + 30 <= minutes < 16 * 60:
+        return "REGULAR"
+    return "AFTER_HOURS"
+
+
+def normalize_market_session(market_state: str | None) -> str:
+    state = str(market_state or "").upper()
+    if state in {"PRE", "PREPRE"}:
+        return "PREMARKET"
+    if state in {"POST", "POSTPOST"}:
+        return "AFTER_HOURS"
+    if state == "REGULAR":
+        return "REGULAR"
+    return get_market_session()
+
+
+def session_label(session: str, lang: str) -> str:
+    if session == "PREMARKET":
+        return tr("premarket_session", lang)
+    if session == "AFTER_HOURS":
+        return tr("afterhours_session", lang)
+    return tr("regular_session", lang)
+
+
+def data_quality_text(value: str, lang: str) -> str:
+    if value == "No extended-hours feed":
+        return tr("no_extended_feed", lang)
+    if value == "Live quote feed":
+        return tr("live_feed", lang)
+    return value or "N/A"
+
+
 def request_json(url: str, params: dict[str, Any] | None = None, timeout: int = 5) -> dict[str, Any]:
     response = requests.get(
         url,
@@ -261,6 +329,62 @@ def request_json(url: str, params: dict[str, Any] | None = None, timeout: int = 
     )
     response.raise_for_status()
     return response.json()
+
+
+def quote_lookup(symbols: list[str], timeout: int) -> dict[str, dict[str, Any]]:
+    quotes: dict[str, dict[str, Any]] = {}
+    for offset in range(0, len(symbols), 50):
+        chunk = symbols[offset : offset + 50]
+        if not chunk:
+            continue
+        payload = request_json(YAHOO_QUOTE_URL, {"symbols": ",".join(chunk)}, timeout)
+        for quote in payload.get("quoteResponse", {}).get("result", []):
+            symbol = quote.get("symbol")
+            if symbol:
+                quotes[symbol] = quote
+    return quotes
+
+
+def parse_quote_fields(quote: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "regular_price": safe_float(quote.get("regularMarketPrice"), np.nan),
+        "regular_close": safe_float(quote.get("regularMarketPreviousClose"), np.nan),
+        "regular_change_pct": safe_float(quote.get("regularMarketChangePercent"), np.nan),
+        "regular_volume": safe_int(quote.get("regularMarketVolume"), 0),
+        "pre_market_price": safe_float(quote.get("preMarketPrice"), np.nan),
+        "pre_market_change_pct": safe_float(quote.get("preMarketChangePercent"), np.nan),
+        "pre_market_volume": safe_int(quote.get("preMarketVolume"), 0),
+        "post_market_price": safe_float(quote.get("postMarketPrice"), np.nan),
+        "post_market_change_pct": safe_float(quote.get("postMarketChangePercent"), np.nan),
+        "post_market_volume": safe_int(quote.get("postMarketVolume"), 0),
+        "market_state": str(quote.get("marketState") or "").upper(),
+    }
+
+
+def session_price_from_quote(fields: dict[str, Any], fallback_close: float) -> tuple[float, str, str]:
+    session = normalize_market_session(fields.get("market_state"))
+    data_quality = "Live quote feed"
+    if session == "PREMARKET":
+        price = safe_float(fields.get("pre_market_price"), np.nan)
+        if np.isnan(price):
+            price = fallback_close
+            data_quality = "No extended-hours feed"
+    elif session == "AFTER_HOURS":
+        price = safe_float(fields.get("post_market_price"), np.nan)
+        if np.isnan(price):
+            price = fallback_close
+            data_quality = "No extended-hours feed"
+    else:
+        price = safe_float(fields.get("regular_price"), np.nan)
+        if np.isnan(price):
+            price = fallback_close
+    return price, session, data_quality
+
+
+def quote_pct_move(price: float, regular_close: float) -> float:
+    if np.isnan(price) or np.isnan(regular_close) or regular_close <= 0:
+        return np.nan
+    return (price - regular_close) / regular_close * 100
 
 
 def yahoo_screener(screen_id: str, count: int, timeout: int) -> list[str]:
@@ -286,7 +410,59 @@ def yahoo_premarket(timeout: int) -> list[str]:
             found.extend(yahoo_screener(screen_id, 40, timeout))
         except Exception:
             continue
-    return dedupe(found)
+    seeds = dedupe(found + FALLBACK_RUNNERS)
+    try:
+        quotes = quote_lookup(seeds, timeout)
+    except Exception:
+        return dedupe(found)
+    candidates: list[str] = []
+    for symbol, quote in quotes.items():
+        fields = parse_quote_fields(quote)
+        price = safe_float(fields["pre_market_price"], np.nan)
+        change_pct = safe_float(fields["pre_market_change_pct"], np.nan)
+        volume = safe_int(fields["pre_market_volume"], 0)
+        if (
+            not np.isnan(price)
+            and safe_float(change_pct, 0) >= 5
+            and (volume > 0 or safe_float(change_pct, 0) >= 10)
+        ):
+            candidates.append(symbol)
+    return dedupe(found + candidates)
+
+
+def yahoo_afterhours_candidates(timeout: int) -> list[str]:
+    seeds: list[str] = []
+    for screen_id in ("day_gainers", "most_actives"):
+        try:
+            seeds.extend(yahoo_screener(screen_id, 80, timeout))
+        except Exception:
+            continue
+    try:
+        seeds.extend(yahoo_trending(timeout))
+    except Exception:
+        pass
+    seeds = dedupe(seeds + FALLBACK_RUNNERS)
+    try:
+        quotes = quote_lookup(seeds, timeout)
+    except Exception:
+        return []
+
+    candidates: list[str] = []
+    for symbol, quote in quotes.items():
+        fields = parse_quote_fields(quote)
+        post_price = safe_float(fields["post_market_price"], np.nan)
+        regular_close = safe_float(fields["regular_close"], np.nan)
+        post_change_pct = safe_float(fields["post_market_change_pct"], np.nan)
+        post_volume = safe_int(fields["post_market_volume"], 0)
+        close_move_pct = quote_pct_move(post_price, regular_close)
+        if (
+            not np.isnan(post_price)
+            and safe_float(post_change_pct, 0) >= 5
+            and (post_volume > 0 or safe_float(post_change_pct, 0) >= 10)
+            and safe_float(close_move_pct, 0) >= 5
+        ):
+            candidates.append(symbol)
+    return dedupe(candidates)
 
 
 def parse_watchlist(value: str) -> list[str]:
@@ -301,6 +477,7 @@ def discover_tickers(optional_watchlist: str, max_tickers: int, request_timeout:
         "Yahoo most_actives": lambda: yahoo_screener("most_actives", 80, request_timeout),
         "Yahoo trending": lambda: yahoo_trending(request_timeout),
         "Yahoo premarket": lambda: yahoo_premarket(request_timeout),
+        "Yahoo afterhours": lambda: yahoo_afterhours_candidates(request_timeout),
     }
     for name, loader in loaders.items():
         try:
@@ -338,13 +515,7 @@ def discover_tickers(optional_watchlist: str, max_tickers: int, request_timeout:
 def quote_batch(symbols: tuple[str, ...], request_timeout: int) -> dict[str, dict[str, Any]]:
     if not symbols:
         return {}
-    payload = request_json(
-        YAHOO_QUOTE_URL,
-        {"symbols": ",".join(symbols)},
-        request_timeout,
-    )
-    quotes = payload.get("quoteResponse", {}).get("result", [])
-    return {quote["symbol"]: quote for quote in quotes if quote.get("symbol")}
+    return quote_lookup(list(symbols), request_timeout)
 
 
 @st.cache_data(ttl=20, show_spinner=False)
@@ -456,6 +627,19 @@ def invalid_row(symbol: str, reason: str = "Invalid data") -> dict[str, Any]:
         "gap_pct": np.nan,
         "gain_pct": np.nan,
         "volume": 0,
+        "session": "REGULAR",
+        "market_state": "",
+        "data_quality": "Invalid data",
+        "regular_price": np.nan,
+        "pre_market_price": np.nan,
+        "pre_market_change_pct": np.nan,
+        "pre_market_volume": 0,
+        "post_market_price": np.nan,
+        "post_market_change_pct": np.nan,
+        "post_market_volume": 0,
+        "session_gain_pct": np.nan,
+        "premarket_runner": False,
+        "after_hours_runner": False,
         "stale_seconds": float("inf"),
         "mismatch_pct": np.nan,
         "valid_trade": False,
@@ -479,17 +663,24 @@ def compute_levels(symbol: str, quote: dict[str, Any], config: ScanConfig) -> di
     if intraday.empty:
         return invalid_row(symbol, "No intraday data")
 
-    current = safe_float(intraday["Close"].iloc[-1], np.nan)
-    quote_price = safe_float(quote.get("regularMarketPrice") or quote.get("preMarketPrice"), np.nan)
+    last_intraday_close = safe_float(intraday["Close"].iloc[-1], np.nan)
+    quote_fields = parse_quote_fields(quote)
+    current, session, data_quality = session_price_from_quote(quote_fields, last_intraday_close)
+
+    if session == "PREMARKET":
+        quote_price = safe_float(quote_fields["pre_market_price"], np.nan)
+    elif session == "AFTER_HOURS":
+        quote_price = safe_float(quote_fields["post_market_price"], np.nan)
+    else:
+        quote_price = safe_float(quote_fields["regular_price"], np.nan)
+
     mismatch_pct = 0.0
     if not np.isnan(quote_price) and quote_price > 0 and not np.isnan(current):
         mismatch_pct = abs(current - quote_price) / quote_price * 100
 
-    previous_close = safe_float(
-        quote.get("regularMarketPreviousClose")
-        or (daily["Close"].iloc[-2] if len(daily) > 1 else np.nan),
-        np.nan,
-    )
+    previous_close = safe_float(quote_fields["regular_close"], np.nan)
+    if np.isnan(previous_close) and len(daily) > 1:
+        previous_close = safe_float(daily["Close"].iloc[-2], np.nan)
     open_price = safe_float(intraday["Open"].iloc[0], np.nan)
     day_high = safe_float(intraday["High"].max(), np.nan)
     day_low = safe_float(intraday["Low"].min(), np.nan)
@@ -508,6 +699,27 @@ def compute_levels(symbol: str, quote: dict[str, Any], config: ScanConfig) -> di
     vol_accel = volume_acceleration(intraday)
     rvol = relative_volume(intraday, daily)
     stale_seconds = latest_bar_age_seconds(intraday)
+    pre_market_price = safe_float(quote_fields["pre_market_price"], np.nan)
+    pre_market_change_pct = safe_float(quote_fields["pre_market_change_pct"], np.nan)
+    post_market_price = safe_float(quote_fields["post_market_price"], np.nan)
+    post_market_change_pct = safe_float(quote_fields["post_market_change_pct"], np.nan)
+    pre_market_close_move_pct = quote_pct_move(pre_market_price, previous_close)
+    post_market_close_move_pct = quote_pct_move(post_market_price, previous_close)
+    premarket_runner = (
+        safe_float(pre_market_change_pct, 0) >= 10
+        or abs(safe_float(pre_market_close_move_pct, 0)) >= 10
+    )
+    after_hours_runner = (
+        safe_float(post_market_change_pct, 0) >= 10
+        or abs(safe_float(post_market_close_move_pct, 0)) >= 10
+    )
+    extended_gain_pct = (
+        pre_market_change_pct if session == "PREMARKET"
+        else post_market_change_pct if session == "AFTER_HOURS"
+        else np.nan
+    )
+    if np.isnan(extended_gain_pct):
+        extended_gain_pct = gain_pct
 
     breakout_level = round(max(day_high, recent_high) * 1.002, 4)
     nhod_level = round(day_high * 1.001, 4)
@@ -553,6 +765,11 @@ def compute_levels(symbol: str, quote: dict[str, Any], config: ScanConfig) -> di
         mode = "Watched Movers"
         trade_status = "INVALID"
         valid_trade = False
+    elif session in {"PREMARKET", "AFTER_HOURS"} and safe_float(extended_gain_pct, 0) > 30:
+        setup = "WAIT FOR PULLBACK"
+        mode = "Premarket Runners" if session == "PREMARKET" else "After-Hours Runners"
+        trade_status = "HOT RUNNER — WAIT FOR PULLBACK"
+        valid_trade = False
     elif safe_float(gain_pct, 0) > 30 and safe_float(extension_from_base, 0) > 18 and current > dip_high * 1.05:
         setup = "WAIT FOR PULLBACK"
         mode = "Watched Movers"
@@ -563,9 +780,24 @@ def compute_levels(symbol: str, quote: dict[str, Any], config: ScanConfig) -> di
         mode = "Watched Movers"
         trade_status = "WAIT"
         valid_trade = False
+    elif session in {"PREMARKET", "AFTER_HOURS"} and 5 <= safe_float(extended_gain_pct, 0) <= 15 and near_trigger:
+        setup = "MOMENTUM TRIGGER"
+        mode = "Early Fire"
+        trade_status = "EARLY FIRE"
+        valid_trade = False
+    elif session == "PREMARKET" and premarket_runner:
+        setup = "MOMENTUM TRIGGER"
+        mode = "Premarket Runners"
+        trade_status = "WATCH"
+        valid_trade = False
+    elif session == "AFTER_HOURS" and after_hours_runner:
+        setup = "MOMENTUM TRIGGER"
+        mode = "After-Hours Runners"
+        trade_status = "WATCH"
+        valid_trade = False
     elif valid_trade and safe_float(gain_pct, 0) >= 10 and near_trigger and safe_float(vol_accel, 0) >= 1.4:
         setup = "NHOD MOMENTUM" if current >= day_high * 0.995 else "MOMENTUM TRIGGER"
-        mode = "Explosive Runners Now"
+        mode = "Regular Market Movers"
         trade_status = "VALID TRADE"
     elif valid_trade and inside_dip_zone and lower_wick_bounce:
         setup = "DIP BUY ZONE"
@@ -631,6 +863,19 @@ def compute_levels(symbol: str, quote: dict[str, Any], config: ScanConfig) -> di
         "gap_pct": gap_pct,
         "gain_pct": gain_pct,
         "volume": day_volume,
+        "session": session,
+        "market_state": quote_fields["market_state"],
+        "data_quality": data_quality,
+        "regular_price": quote_fields["regular_price"],
+        "pre_market_price": pre_market_price,
+        "pre_market_change_pct": pre_market_change_pct,
+        "pre_market_volume": quote_fields["pre_market_volume"],
+        "post_market_price": post_market_price,
+        "post_market_change_pct": post_market_change_pct,
+        "post_market_volume": quote_fields["post_market_volume"],
+        "session_gain_pct": extended_gain_pct,
+        "premarket_runner": premarket_runner,
+        "after_hours_runner": after_hours_runner,
         "stale_seconds": stale_seconds,
         "mismatch_pct": mismatch_pct,
         "valid_trade": valid_trade,
@@ -812,6 +1057,10 @@ def render_metric_card(label: str, value: str) -> None:
 def status_class(status: str) -> str:
     if status == "VALID TRADE":
         return "status-valid"
+    if status == "HOT RUNNER — WAIT FOR PULLBACK":
+        return "status-caution"
+    if status == "EARLY FIRE":
+        return "status-valid"
     if status in {"WAIT", "WATCH", "SCALP"}:
         return "status-wait"
     if status == "INVALID":
@@ -822,6 +1071,8 @@ def status_class(status: str) -> str:
 def status_text(status: str, lang: str) -> str:
     mapping = {
         "VALID TRADE": tr("valid_trade", lang),
+        "HOT RUNNER — WAIT FOR PULLBACK": tr("hot_runner_wait", lang),
+        "EARLY FIRE": tr("early_fire_status", lang),
         "WATCH": tr("watch", lang),
         "WAIT": tr("wait", lang),
         "CAUTION": tr("caution", lang),
@@ -866,6 +1117,7 @@ def render_note_card(label: str, text: str) -> None:
 def render_trade_card(row: pd.Series, lang: str) -> None:
     setup = setup_text(str(row["setup"]), lang)
     status = str(row["trade_status"])
+    session = str(row.get("session", "REGULAR"))
     comments = plan_comments(row, lang)
 
     st.markdown(
@@ -874,7 +1126,7 @@ def render_trade_card(row: pd.Series, lang: str) -> None:
             <div class="trade-head">
                 <div>
                     <div class="trade-title">{html.escape(str(row["ticker"]))} · {html.escape(setup)}</div>
-                    <div class="trade-sub">{html.escape(tr("mode", lang))}: {html.escape(section_title(str(row["mode"]), lang))}</div>
+                    <div class="trade-sub">{html.escape(tr("mode", lang))}: {html.escape(section_title(str(row["mode"]), lang))} · {html.escape(tr("session", lang))}: {html.escape(session_label(session, lang))}</div>
                 </div>
                 <div class="status-pill {status_class(status)}">{html.escape(status_text(status, lang))}</div>
             </div>
@@ -916,6 +1168,8 @@ def render_trade_card(row: pd.Series, lang: str) -> None:
             [
                 {
                     "Previous close": fmt_money(row["previous_close"]),
+                    tr("session", lang): session_label(str(row.get("session", "REGULAR")), lang),
+                    tr("data_quality", lang): data_quality_text(str(row.get("data_quality", "")), lang),
                     "Open": fmt_money(row["open"]),
                     "Day high": fmt_money(row["day_high"]),
                     "Day low": fmt_money(row["day_low"]),
@@ -927,6 +1181,10 @@ def render_trade_card(row: pd.Series, lang: str) -> None:
                     "Near high": fmt_pct(row["near_high_pct"]),
                     "Gap": fmt_pct(row["gap_pct"]),
                     "Volume": f"{safe_int(row['volume']):,}",
+                    "Pre price": fmt_money(row.get("pre_market_price")),
+                    "Pre change": fmt_pct(row.get("pre_market_change_pct")),
+                    "Post price": fmt_money(row.get("post_market_price")),
+                    "Post change": fmt_pct(row.get("post_market_change_pct")),
                     "Data age": f"{safe_float(row['stale_seconds'], 0) / 60:.1f} min",
                 }
             ]
@@ -937,6 +1195,10 @@ def render_trade_card(row: pd.Series, lang: str) -> None:
 def section_title(mode: str, lang: str) -> str:
     lookup = {
         "Explosive Runners Now": tr("explosive", lang),
+        "Premarket Runners": tr("premarket", lang),
+        "Regular Market Movers": tr("regular", lang),
+        "After-Hours Runners": tr("afterhours", lang),
+        "Early Fire": tr("early_fire", lang),
         "Breakout Watch": tr("breakout", lang),
         "Dip Buy Zones": tr("dip", lang),
         "Watched Movers": tr("watched", lang),
@@ -947,13 +1209,20 @@ def section_title(mode: str, lang: str) -> str:
 def section_rows(frame: pd.DataFrame, section: str, max_cards: int) -> pd.DataFrame:
     if frame.empty:
         return frame
-    if section == "Explosive Runners Now":
+    if section == "Premarket Runners":
         return frame[frame["mode"].eq(section)].head(max_cards)
-    if section == "Breakout Watch":
-        return frame[frame["setup"].isin(["BREAKOUT WATCH", "MOMENTUM TRIGGER", "NHOD MOMENTUM"])].head(max_cards)
+    if section == "Regular Market Movers":
+        return frame[
+            frame["session"].eq("REGULAR")
+            & frame["setup"].isin(["BREAKOUT WATCH", "MOMENTUM TRIGGER", "NHOD MOMENTUM", "SCALP ONLY"])
+        ].head(max_cards)
+    if section == "After-Hours Runners":
+        return frame[frame["mode"].eq(section)].head(max_cards)
+    if section == "Early Fire":
+        return frame[frame["mode"].eq(section)].head(max_cards)
     if section == "Dip Buy Zones":
         return frame[frame["setup"].eq("DIP BUY ZONE")].head(max_cards)
-    return frame[~frame["mode"].isin(["Explosive Runners Now", "Dip Buy Zones"])].head(max_cards)
+    return frame[~frame["mode"].isin(["Premarket Runners", "After-Hours Runners", "Early Fire", "Dip Buy Zones"])].head(max_cards)
 
 
 def compact_table(frame: pd.DataFrame, lang: str) -> pd.DataFrame:
@@ -964,6 +1233,7 @@ def compact_table(frame: pd.DataFrame, lang: str) -> pd.DataFrame:
             {
                 tr("ticker", lang): row["ticker"],
                 tr("setup", lang): setup_text(str(row["setup"]), lang),
+                tr("session", lang): session_label(str(row.get("session", "REGULAR")), lang),
                 tr("price", lang): fmt_money(row["current"]),
                 tr("gain", lang): fmt_pct(row["gain_pct"]),
                 tr("rvol", lang): fmt_x(row["rvol"]),
@@ -971,6 +1241,7 @@ def compact_table(frame: pd.DataFrame, lang: str) -> pd.DataFrame:
                 tr("near_high", lang): fmt_pct(row["near_high_pct"]),
                 tr("rr", lang): fmt_rr(row["rr"]),
                 tr("status", lang): status_text(str(row["trade_status"]), lang),
+                tr("data_quality", lang): data_quality_text(str(row.get("data_quality", "")), lang),
             }
             for _, row in frame.iterrows()
         ]
@@ -1070,10 +1341,11 @@ def main() -> None:
     if frame.empty:
         st.warning(tr("no_results", lang))
     else:
-        render_section(frame, "Explosive Runners Now", lang, config.max_cards)
-        render_section(frame, "Breakout Watch", lang, config.max_cards)
+        render_section(frame, "Premarket Runners", lang, config.max_cards)
+        render_section(frame, "Regular Market Movers", lang, config.max_cards)
+        render_section(frame, "After-Hours Runners", lang, config.max_cards)
+        render_section(frame, "Early Fire", lang, config.max_cards)
         render_section(frame, "Dip Buy Zones", lang, config.max_cards)
-        render_section(frame, "Watched Movers", lang, config.max_cards)
         with st.expander(tr("compact", lang)):
             st.dataframe(compact_table(frame.head(60), lang), use_container_width=True, hide_index=True)
 
