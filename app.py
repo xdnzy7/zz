@@ -101,6 +101,24 @@ TEXT = {
         "mode": "Scanner mode",
         "session": "Session",
         "data_quality": "Data Quality",
+        "previous_close": "Previous close",
+        "open": "Open",
+        "day_high": "Day high",
+        "day_low": "Day low",
+        "nhod": "NHOD",
+        "vwap": "VWAP",
+        "support": "Support",
+        "extension": "Extension",
+        "volume": "Volume",
+        "pre_price": "Premarket price",
+        "pre_change": "Premarket change",
+        "post_price": "After-hours price",
+        "post_change": "After-hours change",
+        "data_age": "Data age",
+        "minutes": "min",
+        "ticker_count": "Tickers",
+        "fallback_active": "Fallback runner list active",
+        "live_discovery": "Live discovery active",
         "footer": "Not financial advice. This app filters live conditions and builds risk-defined plans; it does not predict outcomes.",
         "valid_trade": "VALID TRADE",
         "hot_runner_wait": "HOT RUNNER — WAIT FOR PULLBACK",
@@ -115,6 +133,8 @@ TEXT = {
         "afterhours_session": "AFTER HOURS",
         "no_extended_feed": "No extended-hours feed",
         "live_feed": "Live quote feed",
+        "na": "N/A",
+        "invalid_data_text": "Invalid data",
         "flat": "No change",
     },
     "Arabic": {
@@ -166,6 +186,24 @@ TEXT = {
         "mode": "وضع الماسح",
         "session": "الجلسة",
         "data_quality": "جودة البيانات",
+        "previous_close": "الإغلاق السابق",
+        "open": "الافتتاح",
+        "day_high": "أعلى سعر اليوم",
+        "day_low": "أدنى سعر اليوم",
+        "nhod": "قمة جديدة اليوم",
+        "vwap": "متوسط VWAP",
+        "support": "الدعم",
+        "extension": "الامتداد",
+        "volume": "الحجم",
+        "pre_price": "سعر ما قبل الافتتاح",
+        "pre_change": "تغير ما قبل الافتتاح",
+        "post_price": "سعر بعد الإغلاق",
+        "post_change": "تغير بعد الإغلاق",
+        "data_age": "عمر البيانات",
+        "minutes": "دقيقة",
+        "ticker_count": "عدد الرموز",
+        "fallback_active": "تم استخدام قائمة احتياطية للرموز النشطة",
+        "live_discovery": "الاكتشاف الحي يعمل",
         "footer": "ليست نصيحة مالية. التطبيق يرشح الشروط الحية ويبني خطة مخاطرة؛ ولا يتنبأ بالنتائج.",
         "valid_trade": "صفقة صالحة",
         "hot_runner_wait": "سهم ساخن — انتظر رجوع السعر",
@@ -180,6 +218,8 @@ TEXT = {
         "afterhours_session": "بعد الإغلاق",
         "no_extended_feed": "لا توجد بيانات ممتدة",
         "live_feed": "بيانات أسعار حية",
+        "na": "غير متاح",
+        "invalid_data_text": "بيانات غير صالحة",
         "flat": "بدون تغيير",
     },
 }
@@ -317,7 +357,38 @@ def data_quality_text(value: str, lang: str) -> str:
         return tr("no_extended_feed", lang)
     if value == "Live quote feed":
         return tr("live_feed", lang)
-    return value or "N/A"
+    if value == "Invalid data":
+        return tr("invalid_data_text", lang)
+    return value or tr("na", lang)
+
+
+def discovery_message_text(value: str, lang: str) -> str:
+    if value == "Fallback runner list active":
+        return tr("fallback_active", lang)
+    if value == "Live discovery active":
+        return tr("live_discovery", lang)
+    return value or tr("na", lang)
+
+
+def source_name_text(value: str, lang: str) -> str:
+    if not is_arabic(lang):
+        return value
+    mapping = {
+        "Yahoo day_gainers": "ياهو: الرابحون اليوم",
+        "Yahoo most_actives": "ياهو: الأكثر نشاطا",
+        "Yahoo trending": "ياهو: الرائجة",
+        "Yahoo premarket": "ياهو: قبل الافتتاح",
+        "Yahoo afterhours": "ياهو: بعد الإغلاق",
+        "Optional watchlist": "قائمة المراقبة الاختيارية",
+        "Fallback runners": "قائمة احتياطية للرموز النشطة",
+    }
+    return mapping.get(value, value)
+
+
+def localize_display(value: str, lang: str) -> str:
+    if is_arabic(lang):
+        return str(value).replace("N/A", tr("na", lang)).replace(" min", f" {tr('minutes', lang)}")
+    return str(value)
 
 
 def request_json(url: str, params: dict[str, Any] | None = None, timeout: int = 5) -> dict[str, Any]:
@@ -968,6 +1039,11 @@ def apply_theme(lang: str) -> None:
             border: 1px solid rgba(255, 255, 255, .08);
             border-radius: 8px;
             overflow: hidden;
+            direction: {direction};
+        }}
+        div[data-testid="stDataFrame"] div,
+        div[data-testid="stDataFrame"] span {{
+            text-align: {align};
         }}
         .trade-card {{
             border: 1px solid rgba(255, 255, 255, .10);
@@ -1032,6 +1108,11 @@ def apply_theme(lang: str) -> None:
             line-height: 1.05;
             font-variant-numeric: tabular-nums;
         }}
+        div[data-testid="stVerticalBlockBorderWrapper"] > div {{
+            background: rgba(255,255,255,.035);
+            border-color: rgba(255,255,255,.10);
+            border-radius: 12px;
+        }}
         @media (max-width: 760px) {{
             .trade-head {{ display: block; }}
             .status-pill {{ display: inline-block; margin-top: .6rem; }}
@@ -1043,6 +1124,8 @@ def apply_theme(lang: str) -> None:
 
 
 def render_metric_card(label: str, value: str) -> None:
+    lang = st.session_state.get("language", "English")
+    value = localize_display(value, lang)
     st.markdown(
         f"""
         <div class="metric-card">
@@ -1111,7 +1194,8 @@ def plan_comments(row: pd.Series, lang: str) -> dict[str, str]:
 def render_note_card(label: str, text: str) -> None:
     with st.container(border=True):
         st.markdown(f"**{label}**")
-        st.write(text if text else "N/A")
+        lang = st.session_state.get("language", "English")
+        st.write(text if text else tr("na", lang))
 
 
 def render_trade_card(row: pd.Series, lang: str) -> None:
@@ -1167,25 +1251,25 @@ def render_trade_card(row: pd.Series, lang: str) -> None:
         details = pd.DataFrame(
             [
                 {
-                    "Previous close": fmt_money(row["previous_close"]),
+                    tr("previous_close", lang): localize_display(fmt_money(row["previous_close"]), lang),
                     tr("session", lang): session_label(str(row.get("session", "REGULAR")), lang),
                     tr("data_quality", lang): data_quality_text(str(row.get("data_quality", "")), lang),
-                    "Open": fmt_money(row["open"]),
-                    "Day high": fmt_money(row["day_high"]),
-                    "Day low": fmt_money(row["day_low"]),
-                    "NHOD": fmt_money(row["nhod_level"]),
-                    "VWAP": fmt_money(row["vwap"]),
-                    "Support": fmt_money(row["support"]),
-                    "Extension": fmt_pct(row["extension_from_base"]),
-                    "Volume acceleration": fmt_x(row["vol_accel"]),
-                    "Near high": fmt_pct(row["near_high_pct"]),
-                    "Gap": fmt_pct(row["gap_pct"]),
-                    "Volume": f"{safe_int(row['volume']):,}",
-                    "Pre price": fmt_money(row.get("pre_market_price")),
-                    "Pre change": fmt_pct(row.get("pre_market_change_pct")),
-                    "Post price": fmt_money(row.get("post_market_price")),
-                    "Post change": fmt_pct(row.get("post_market_change_pct")),
-                    "Data age": f"{safe_float(row['stale_seconds'], 0) / 60:.1f} min",
+                    tr("open", lang): localize_display(fmt_money(row["open"]), lang),
+                    tr("day_high", lang): localize_display(fmt_money(row["day_high"]), lang),
+                    tr("day_low", lang): localize_display(fmt_money(row["day_low"]), lang),
+                    tr("nhod", lang): localize_display(fmt_money(row["nhod_level"]), lang),
+                    tr("vwap", lang): localize_display(fmt_money(row["vwap"]), lang),
+                    tr("support", lang): localize_display(fmt_money(row["support"]), lang),
+                    tr("extension", lang): localize_display(fmt_pct(row["extension_from_base"]), lang),
+                    tr("vol_acc", lang): localize_display(fmt_x(row["vol_accel"]), lang),
+                    tr("near_high", lang): localize_display(fmt_pct(row["near_high_pct"]), lang),
+                    tr("gap", lang): localize_display(fmt_pct(row["gap_pct"]), lang),
+                    tr("volume", lang): f"{safe_int(row['volume']):,}",
+                    tr("pre_price", lang): localize_display(fmt_money(row.get("pre_market_price")), lang),
+                    tr("pre_change", lang): localize_display(fmt_pct(row.get("pre_market_change_pct")), lang),
+                    tr("post_price", lang): localize_display(fmt_money(row.get("post_market_price")), lang),
+                    tr("post_change", lang): localize_display(fmt_pct(row.get("post_market_change_pct")), lang),
+                    tr("data_age", lang): f"{safe_float(row['stale_seconds'], 0) / 60:.1f} {tr('minutes', lang)}",
                 }
             ]
         )
@@ -1234,12 +1318,12 @@ def compact_table(frame: pd.DataFrame, lang: str) -> pd.DataFrame:
                 tr("ticker", lang): row["ticker"],
                 tr("setup", lang): setup_text(str(row["setup"]), lang),
                 tr("session", lang): session_label(str(row.get("session", "REGULAR")), lang),
-                tr("price", lang): fmt_money(row["current"]),
-                tr("gain", lang): fmt_pct(row["gain_pct"]),
-                tr("rvol", lang): fmt_x(row["rvol"]),
-                tr("vol_acc", lang): fmt_x(row["vol_accel"]),
-                tr("near_high", lang): fmt_pct(row["near_high_pct"]),
-                tr("rr", lang): fmt_rr(row["rr"]),
+                tr("price", lang): localize_display(fmt_money(row["current"]), lang),
+                tr("gain", lang): localize_display(fmt_pct(row["gain_pct"]), lang),
+                tr("rvol", lang): localize_display(fmt_x(row["rvol"]), lang),
+                tr("vol_acc", lang): localize_display(fmt_x(row["vol_accel"]), lang),
+                tr("near_high", lang): localize_display(fmt_pct(row["near_high_pct"]), lang),
+                tr("rr", lang): localize_display(fmt_rr(row["rr"]), lang),
                 tr("status", lang): status_text(str(row["trade_status"]), lang),
                 tr("data_quality", lang): data_quality_text(str(row.get("data_quality", "")), lang),
             }
@@ -1331,9 +1415,14 @@ def main() -> None:
     k4.metric(tr("hot", lang), f"{hot_count:,}")
 
     with st.expander(tr("sources", lang)):
-        st.write(st.session_state.discovery_message)
+        st.write(discovery_message_text(st.session_state.discovery_message, lang))
         st.dataframe(
-            pd.DataFrame([{"Source": name, "Tickers": count} for name, count in st.session_state.source_counts.items()]),
+            pd.DataFrame(
+                [
+                    {tr("source", lang): source_name_text(name, lang), tr("ticker_count", lang): count}
+                    for name, count in st.session_state.source_counts.items()
+                ]
+            ),
             use_container_width=True,
             hide_index=True,
         )
